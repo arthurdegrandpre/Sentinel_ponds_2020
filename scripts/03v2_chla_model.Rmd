@@ -1,0 +1,314 @@
+---
+title: "03v2_chla_model"
+author: "Arthur de Grandpré"
+date: "9 août 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE, message=F, warning=F}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls());gc()
+library(stargazer)
+library(tidyverse)
+library(ggplot2)
+library(reshape2)
+library(lubridate)
+library(car)
+library(MuMIn)
+library(MASS)
+library(gridExtra)
+library(sjPlot)
+library(sjmisc)
+library(sjlabelled)
+```
+
+#Context
+
+This markdown file contains the code used to predict chlorophyll-a in midden-limburg's ponds based on sentinel-2 data and weekly field measurements in 2015.  
+
+While we had a first version based solely on iCOR's atmospheric correction, Nic has provided us with Acolite corrected data, which will be compared to iCOR's in the first part of this document.
+
+After having some issues with spatial mismatch due to data transformation, this is a third attemps at modelling chla using this acolite corrected data, although not including the similarity spectrum correction.
+
+The structure of the Acolite data differs from the one we were using from iCOR as of how it was generated.  
+
+- The way we used *iCOR* is that we extracted the pixel value of specific coordinates for every dates, and then filtered them using cloud and shadow masks. Meaning this data was susceptible to spatial error. For this reason, we added a filter that was based on distance from pond borders, to make sure all pixels were from inside an actual pond. This method allows for pixels to be mapped individually, and for emerging vegetation to be monitored.
+
+- In the case of *Acolite*, we basically have all pond associated pixels from images, and those were then filtered using a 0.3 B2 treshold to exclude clouds, and an 0.08 NIR threshold to exclude emerging vegetation.
+
+**Note** that in both cases, negative pixel values may occur. Those pixels were removed in iCOR, and untouched in Acolite. In Acolite, it is because of the use of a single band correction factor being substracted. Wereas we are unsure about iCOR.  
+  
+
+
+#Data exploration
+
+First of all, let's read the Acolite data as made by Nic [refiltered].
+
+```{r acolite data}
+
+acolite=read.csv("./data/simspec2020.csv")
+acolite$date=ymd(gsub("_","-",acolite$date))
+colnames(acolite)
+acolite=acolite[,c(-1,-2)]
+colnames(acolite) = c("x","y","b1","b2","b3","b4","b5","b6","b7","b8","b8a","b11","b12","date","satellite","pond","class")
+stargazer(acolite, type="text")
+
+acolite[,3:13][acolite[,3:13]<0]=0
+
+```
+
+The data contains 41583 observations of 17 variables (previously 21 211 observations of 17 variables), the first being useless (X), and then reflectance values for all bands except 9 and 10 (?). It also contains the date, the associated pond code and the satellite ID. (in Acolite, I think both Sentinel A and B are corrected differently?)  
+
+```{r summarize per pond per date}
+ac_msd = acolite %>%
+  filter(class=="water") %>% 
+  group_by(date, pond) %>%
+  summarise_at(vars(b1,b2,b3,b4,b5,b6,b7,b8,b8a,b11,b12), funs(mean,sd)) %>%
+  ungroup
+
+ac_m = ac_msd[1:13]
+colnames(ac_m)=c("date","pond","b1","b2","b3","b4","b5","b6","b7","b8","bx","b11","b12") #b8a becomes bx so there are no conflicts
+ac_m$source="acolite"
+
+```
+
+
+```{r eyerusalem interpolated data}
+edf=read.csv("./data/eyerusalem_data_interp.csv")
+colnames(edf)=c("unkown","date","pond","chla.rfu","pc.rfu","sub.cover","sneller","chla") # chla is extracted from chla.rfu based on this equation : 0.0428*CHLA.rfu+3.2467
+
+edf$date=ymd(edf$date)
+
+df=left_join(ac_m, edf)
+df=df[complete.cases(df),]
+```
+
+
+## Adding spectral ratios from litterature
+
+Those ratios have been taken from the litterature and are correctly cited in Nic's Master thesis
+
+```{r adding spectral ratios from litterature}
+df$a <- df$b3/df$b1 # note that band 1 is 60m in resolution
+df$k <- df$b3/df$b2 # ratio b renamed to k to for conflict resolution
+# green-red
+df$c <- df$b3/df$b4
+# NIR-red
+df$d <- df$b5/df$b4
+df$e <- df$b6/df$b4
+df$f <- df$b7/df$b4
+df$g <- df$bx/df$b4
+df$h <- df$b8/df$b4
+# NIR-red 3-and
+df$i <- (df$b5+df$b6)/df$b4
+df$j <- df$b5-((df$b4+df$b6)/2)
+
+df$logchla=log(df$chla) # this is just to make readings easier
+```
+
+## Adding emerged vegetation cover
+
+New from 2020
+
+```{r}
+evdf = read.csv("./data/emerging_vegetation_simspec.csv")
+evdf = evdf[,c(2,3,7)]
+colnames(evdf)=c("pond","date","v")
+evdf$date = ymd(evdf$date)
+df = left_join(df,evdf)
+```
+
+## Summarising to monthly data
+As we are using interpolated field data, we are creating major errors. If we pool data monthly, the model should be much more robust and lower the risk of overfitting.
+
+```{r monthly mean of everything}
+df$date=ymd(df$date)
+dfm = df %>% group_by(month=floor_date(date, "month"),pond) %>% summarize_at(vars(b1,b2,b3,b4,b5,b6,b7,b8,bx,b11,b12,a,k,c,d,e,f,g,h,i,j,chla,logchla,chla.rfu,pc.rfu,sub.cover,sneller,v),funs(mean)) %>% ungroup 
+```
+
+
+## model selector
+
+To make the modelling process easier, I made a function that runs a bidirectional stepwise model selection with all variables, checks the vif on the final model and if the max vif value is higher than 5, it removes the highest vif variable and runs again until every variables are under the threshold. This allows to simply add all spectral variables in the model without looking at autocorrelation first. Since we expect a lot of noise in the data and many confounding factors, all bands and ratios are included to maximise the probability of finding discriminating bands. Of course, this could lead to overfitting of the data, which is why many models will be considered and validated against each other.
+
+```{r make a model selection function using stepwise bidirectionnal selection}
+model_selector = function(initial_model,dataset){
+
+  final_model=initial_model
+  fit=lm(final_model, data=dataset)
+  step=stepAIC(fit, direction="both",trace=F) # this is the actual model tester
+  
+dha = as.data.frame(attributes(step$anova)$heading)
+dhas=dha[(which(dha$`attributes(step$anova)$heading`=="\nFinal Model:")+1):(length(dha$`attributes(step$anova)$heading`)-1),]
+fit_step=lm(paste0(dhas[1:length(dhas)]),data=dataset)
+
+vif_s=vif(fit_step)
+max_vif=which(vif_s==max(vif_s)) # if the variable with the highest vif has a score over 5, this variable will be removed within the following repeat loop
+
+      if (max(vif_s)>5) {
+ repeat {
+max_vif
+  ifelse(max_vif==1,
+         (gsub_model=gsub(paste0(names(max_vif)," + "),"",final_model, fixed=T)),
+         (gsub_model=gsub(paste0(" + ",names(max_vif)),"",final_model, fixed=T))
+         )
+
+    ifelse((length(gsub_model)>1),
+           (final_model=paste(gsub_model[2],gsub_model[1],gsub_model[3])),
+           (final_model=gsub_model)
+           )
+  
+    fit=lm(final_model, data=dataset)
+    step=stepAIC(fit,direction="both",trace=F)
+
+dha = as.data.frame(attributes(step$anova)$heading)
+dhas=dha[(which(dha$`attributes(step$anova)$heading`=="\nFinal Model:")+1):(length(dha$`attributes(step$anova)$heading`)-1),]
+dhas
+fit_step=lm(paste0(dhas[1:length(dhas)]),data=dataset)
+length(fit_step$coefficients)
+    
+ if (length(fit_step$coefficients)==2) break   
+
+        vif_s=vif(fit_step)
+    max_vif=which(vif_s==max(vif_s))
+    #exit condition
+    if (max(vif_s)<5) break}}
+
+  return(step$anova)
+}
+
+```
+
+## Acolite modelling
+
+This section will use Acolite data with all the bands and ratios
+
+### Acolite modelling excluding band 1
+
+Because the use of 60m resolution data seems like a problem in a system like midden-limburg, the modelling exercice will be applied will excluding 60m data.
+
+```{r 20m modelling}
+initial_model=sqrt(chla)~b2+b3+b4+b5+b6+b7+b8+bx+b11+b12+k+c+d+e+f+g+h+i+j+v
+dataset=dfm
+
+model=model_selector(initial_model, dataset)
+
+bestfit=lm(attributes(model)$heading[length(attributes(model)$heading)-1], data=dfm)
+summary(bestfit)
+options(na.action=na.fail)
+d=(dredge(bestfit))
+head(d)
+options(na.action=na.omit)
+
+bestfit=lm(logchla ~ b8 + b11 + h + j, data=dataset)
+
+summary(bestfit)
+plot(bestfit)
+hist(resid(bestfit))
+sqrt(mean(bestfit$residuals^2))
+
+dfm$chla.p = predict(bestfit, new.data=dfm)
+  
+plot(dfm$chla.p~sqrt(dfm$chla),
+     main="Acolite",
+     xlab="sqrt Measured monthly mean Chlorophyll a (ug/L)",
+     ylab="sqrt Predicted monthly mean Chlorophyll a (ug/L)")
+
+```
+
+### Acolite Polynomial
+
+To obtain the best overrall linear regression model, linearising the residuals distribution is important, and since the residuals presentend a slight curve, using a polynomial approach in the linear modelling should fix this.  
+This linearisation could be done in two ways: redo the whole model selection based on polynomial variables, or using the best linear model and changing it into polynomial terms.  
+
+While it is to be expected that including so many variables as polynomials will lead to a very strong model, it should also be considered cautiously because it also increases the risks of overfitting.  
+
+#### Using best linear model
+
+```{r non linear modelling on best model}
+bestfit # it uses b and c
+
+curvefit=lm(sqrt(chla)~poly(b5,2)+poly(b7,2)+poly(h,2), data=dfm)
+summary(curvefit)
+# plot(curvefit)
+hist(resid(curvefit))
+sqrt(mean(curvefit$residuals^2))
+
+dfm$chla.c = predict(curvefit, new.data=dfm)
+
+par(mfrow=c(1,2))
+plot(dfm$chla.p^2~dfm$chla, main="Acolite linear",
+     xlab="Measured monthly mean Chlorophyll a (ug/L)",
+     ylab="Predicted monthly mean Chlorophyll a (ug/L)")
+     # xlim=c(2,5.6),
+     # ylim=c(2,5.6))
+plot(dfm$chla.c^2~dfm$chla,
+     main="Acolite curve",
+     xlab="Measured mean monthly Chlorophyll a (ug/L)",
+     ylab="Predicted monthly mean Chlorophyll a (ug/L)")
+     # xlim=c(2,5.6),
+     # ylim=c(2,5.6))
+
+```
+
+# Overview of chlorophyll prediction model 
+
+Now, let's take a better look at the predicted values and their accuracy. In order to do that, we can look at MAE and RMSE for the different categories, aswell as how the different ponds differ in prediction performance.
+
+First, let's add the pond category variable, as provided by Eyerusalem.
+```{r adding Eyerusalems categories,message=F,warning=F}
+categories=read.csv("data/pond_categories_fixed.csv", sep=";")
+categories[,4:9]=NULL
+dfmc = left_join(dfm,categories, by="pond")
+```
+
+Since dfmc has a whooping 33 variables, let's reduce this a bit.
+
+```{r}
+dff=dfmc[,c(1,2,15,16,24,25,27,28,29,32,33)]
+dff$logchla.c=predict(curvefit, new.data=dff)
+dff$chla.p=exp(dff$logchla.c)
+```
+
+Now that dff has 13 variables, let's calculate the error for the whole dataset.
+
+```{r}
+# Function that returns Root Mean Squared Error
+rmse <- function(error)
+{sqrt(mean(error^2))}
+ 
+# Function that returns Mean Absolute Error
+mae <- function(error)
+{mean(abs(error))}
+
+# Calculate error
+error <- dff$chla - dff$chla.p
+
+paste("RMSE =", rmse(error))
+paste("MAE =", mae(error))
+
+```
+
+While, to me, this seems to be quite high, it is quite reasonnable considering the range of values observed in the system.  
+To further illustrate that point, let's look at the predicted vs observed scatterplot, including a 1:1 line and a loess smooth
+
+```{r, echo = FALSE}
+ggplot(dff, aes(x=chla, y=chla.p))+
+  geom_abline(slope=1, intercept=0, col="grey")+
+  geom_point()+
+  geom_smooth()+
+  geom_smooth(method=lm, se=F, col="red")+
+  xlim(0,225)+
+  ylim(0,225)+
+  # annotate("text",x = 60, y = 200, label = "log(y) = 3.83 + 4.42b7 - 1.98b7^2 - 1.07b8 - 0.99b8^2 + 5.32c - 2.60c^2 + 2.40j - 0.62j^2")+
+  # annotate("text",x = 20, y = 180, label = "R2 adj. = 0.67")+
+  # annotate("text",x = 20, y = 160, label = "MAE = 24.51")+
+  # annotate("text",x = 20, y = 140, label = "RMSE = 34.71")+
+  xlab("Measured Chl-a (ug/L)")+
+  ylab("Predicted Chl-a (ug/L)")+
+  ggtitle("Selected model for Chlorophyll-a prediction using S2 in ponds")+
+  theme_classic()
+
+write.csv(dff, "data/predicted_chla.csv") # so this data can be accessed easily
+```
+

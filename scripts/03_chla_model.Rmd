@@ -1,0 +1,944 @@
+---
+title: "chla_model"
+author: "Arthur de Grandpré"
+date: "19 mai 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE, message=F, warning=F}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls());gc()
+library(stargazer)
+library(tidyverse)
+library(ggplot2)
+library(reshape2)
+library(lubridate)
+library(car)
+library(MuMIn)
+library(MASS)
+library(gridExtra)
+library(sjPlot)
+library(sjmisc)
+library(sjlabelled)
+```
+
+#Context
+
+This markdown file contains the code used to predict chlorophyll-a in midden-limburg's ponds based on sentinel-2 data and weekly field measurements in 2015.  
+
+While we had a first version based solely on iCOR's atmospheric correction, Nic has provided us with Acolite corrected data, which will be compared to iCOR's in the first part of this document.
+
+After having some issues with spatial mismatch due to data transformation, this is a third attemps at modelling chla using this acolite corrected data, although not including the similarity spectrum correction.
+
+The structure of the Acolite data differs from the one we were using from iCOR as of how it was generated.  
+
+- The way we used *iCOR* is that we extracted the pixel value of specific coordinates for every dates, and then filtered them using cloud and shadow masks. Meaning this data was susceptible to spatial error. For this reason, we added a filter that was based on distance from pond borders, to make sure all pixels were from inside an actual pond. This method allows for pixels to be mapped individually, and for emerging vegetation to be monitored.
+
+- In the case of *Acolite*, we basically have all pond associated pixels from images, and those were then filtered using a 0.3 B2 treshold to exclude clouds, and an 0.08 NIR threshold to exclude emerging vegetation.
+
+**Note** that in both cases, negative pixel values may occur. Those pixels were removed in iCOR, and untouched in Acolite. In Acolite, it is because of the use of a single band correction factor being substracted. Wereas we are unsure about iCOR.  
+  
+
+
+#Data exploration
+
+First of all, let's read the Acolite data as made by Nic [refiltered].
+
+```{r acolite data}
+
+acolite=read.csv("./data/simspec2020.csv")
+
+acolite$date=gsub("_","-",acolite$date)
+colnames(acolite)
+acolite=acolite[,c(-1,-2)]
+colnames(acolite) = c("x","y","b1","b2","b3","b4","b5","b6","b7","b8","b8a","b11","b12","date","satellite","pond","class")
+stargazer(acolite, type="text")
+
+
+```
+
+The data contains 41583 observations of 17 variables (previously 21 211 observations of 17 variables), the first being useless (X), and then reflectance values for all bands except 9 and 10 (?). It also contains the date, the associated pond code and the satellite ID. (in Acolite, I think both Sentinel A and B are corrected differently?)  
+
+```{r summarize per pond per date}
+str(acolite)
+ac_msd = acolite %>%
+  filter(class=="water")
+  group_by(date, pond) %>%
+  summarise_at(vars(b1,b2,b3,b4,b5,b6,b7,b8,b8a,b11,b12), funs(mean,sd)) %>%
+  ungroup
+
+ac_m = ac_msd[1:13]
+colnames(ac_m)=c("date","pond","b1","b2","b3","b4","b5","b6","b7","b8","bx","b11","b12") #b8a becomes bx so there are no conflicts
+ac_m$source="acolite"
+
+```
+
+This code uses dplyr from tidyverse to obtain mean and sd of all bands for every pond at every date. While sd is quite important, for now let's focus on mean values.  
+
+# Multivariate linear regression modelling of chl-a
+
+## Adding chlorophyll data to Acolite 
+
+Eyerusalem's field data has been linearly interpolated from weekly observations to daily data in order to maximise the match between satellite overpasses and field observations. Because this creates a massive error, the data will be summarised by month, making temporal resolution lower, but more robust.
+
+```{r eyerusalem interpolated data}
+
+edf=read.csv("./data/eyerusalem_data_interp.csv")
+colnames(edf)=c("unkown","date","pond","chla.rfu","pc.rfu","sub.cover","sneller","chla") # chla is extracted from chla.rfu based on this equation : 0.0428*CHLA.rfu+3.2467
+df=left_join(ac_m, edf)
+df=df[complete.cases(df),]
+```
+
+## Adding spectral ratios from litterature
+
+Those ratios have been taken from the litterature and are correctly cited in Nic's Master thesis
+
+```{r adding spectral ratios from litterature}
+df$a <- df$b3/df$b1 # note that band 1 is 60m in resolution
+df$k <- df$b3/df$b2 # ratio b renamed to k to for conflict resolution
+# green-red
+df$c <- df$b3/df$b4
+# NIR-red
+df$d <- df$b5/df$b4
+df$e <- df$b6/df$b4
+df$f <- df$b7/df$b4
+df$g <- df$bx/df$b4
+df$h <- df$b8/df$b4
+# NIR-red 3-and
+df$i <- (df$b5+df$b6)/df$b4
+df$j <- df$b5-((df$b4+df$b6)/2)
+
+df$logchla=log(df$chla) # this is just to make readings easier
+```
+
+## Adding emerged vegetation cover
+
+New from 2020
+
+```{r}
+evdf = read.csv("./data/emerging_vegetation.csv")
+evdf = evdf[,c(2,3,7)]
+colnames(evdf)=c("pond","date","v")
+# evdf$date = ymd(evdf$date)
+df = left_join(df,evdf)
+```
+
+## Summarising to monthly data
+As we are using interpolated field data, we are creating major errors. If we pool data monthly, the model should be much more robust and lower the risk of overfitting.
+
+```{r monthly mean of everything}
+df$date=ymd(df$date)
+dfm = df %>% group_by(month=floor_date(date, "month"),pond) %>% summarize_at(vars(b1,b2,b3,b4,b5,b6,b7,b8,bx,b11,b12,a,k,c,d,e,f,g,h,i,j,chla,logchla,chla.rfu,pc.rfu,sub.cover,sneller,v),funs(mean)) %>% ungroup 
+
+```
+
+## model selector
+
+To make the modelling process easier, I made a function that runs a bidirectional stepwise model selection with all variables, checks the vif on the final model and if the max vif value is higher than 5, it removes the highest vif variable and runs again until every variables are under the threshold. This allows to simply add all spectral variables in the model without looking at autocorrelation first. Since we expect a lot of noise in the data and many confounding factors, all bands and ratios are included to maximise the probability of finding discriminating bands. Of course, this could lead to overfitting of the data, which is why many models will be considered and validated against each other.
+
+```{r make a model selection function using stepwise bidirectionnal selection}
+model_selector = function(initial_model,dataset){
+
+  final_model=initial_model
+  fit=lm(final_model, data=dataset)
+  step=stepAIC(fit, direction="both",trace=F) # this is the actual model tester
+  
+dha = as.data.frame(attributes(step$anova)$heading)
+dhas=dha[(which(dha$`attributes(step$anova)$heading`=="\nFinal Model:")+1):(length(dha$`attributes(step$anova)$heading`)-1),]
+fit_step=lm(paste0(dhas[1:length(dhas)]),data=dataset)
+
+vif_s=vif(fit_step)
+max_vif=which(vif_s==max(vif_s)) # if the variable with the highest vif has a score over 5, this variable will be removed within the following repeat loop
+
+      if (max(vif_s)>5) {
+ repeat {
+max_vif
+  ifelse(max_vif==1,
+         (gsub_model=gsub(paste0(names(max_vif)," + "),"",final_model, fixed=T)),
+         (gsub_model=gsub(paste0(" + ",names(max_vif)),"",final_model, fixed=T))
+         )
+
+    ifelse((length(gsub_model)>1),
+           (final_model=paste(gsub_model[2],gsub_model[1],gsub_model[3])),
+           (final_model=gsub_model)
+           )
+  
+    fit=lm(final_model, data=dataset)
+    step=stepAIC(fit,direction="both",trace=F)
+
+dha = as.data.frame(attributes(step$anova)$heading)
+dhas=dha[(which(dha$`attributes(step$anova)$heading`=="\nFinal Model:")+1):(length(dha$`attributes(step$anova)$heading`)-1),]
+dhas
+fit_step=lm(paste0(dhas[1:length(dhas)]),data=dataset)
+length(fit_step$coefficients)
+    
+ if (length(fit_step$coefficients)==2) break   
+
+        vif_s=vif(fit_step)
+    max_vif=which(vif_s==max(vif_s))
+    #exit condition
+    if (max(vif_s)<5) break}}
+
+  return(step$anova)
+}
+
+```
+
+## Acolite modelling
+
+This section will use Acolite data with all the bands and ratios
+
+### Acolite modelling excluding band 1
+
+Because the use of 60m resolution data seems like a problem in a system like midden-limburg, the modelling exercice will be applied will excluding 60m data.
+
+```{r 20m modelling}
+initial_model=logchla~b2+b3+b4+b5+b6+b7+b8+bx+b11+b12+k+c+d+e+f+g+h+i+j+v
+dataset=dfm
+
+model=model_selector(initial_model, dataset)
+
+bestfit=lm(attributes(model)$heading[length(attributes(model)$heading)-1], data=dfm)
+summary(bestfit)
+options(na.action=na.fail)
+d=(dredge(bestfit))
+head(d)
+options(na.action=na.omit)
+
+bestfit=lm(logchla ~ b7 + b8 + c + j, data=dataset)
+
+summary(bestfit)
+# plot(bestfit)
+hist(resid(bestfit))
+sqrt(mean(bestfit$residuals^2))
+
+dfm$logchla.p = predict(bestfit, new.data=dfm)
+  
+plot(dfm$logchla.p~log(dfm$chla), main="Acolite", xlab="log Measured monthly mean Chlorophyll a (ug/L)", ylab="log Predicted monthly mean Chlorophyll a (ug/L)")
+
+```
+
+### Acolite Polynomial
+
+To obtain the best overrall linear regression model, linearising the residuals distribution is important, and since the residuals presentend a slight curve, using a polynomial approach in the linear modelling should fix this.  
+This linearisation could be done in two ways: redo the whole model selection based on polynomial variables, or using the best linear model and changing it into polynomial terms.  
+
+While it is to be expected that including so many variables as polynomials will lead to a very strong model, it should also be considered cautiously because it also increases the risks of overfitting.  
+
+#### Using best linear model
+
+```{r non linear modelling on best model}
+bestfit # it uses b and c
+
+curvefit=lm(logchla~poly(b7,2)+poly(b8,2)+poly(c,2)+poly(j,2), data=dfm)
+summary(curvefit)
+# plot(curvefit)
+hist(resid(curvefit))
+sqrt(mean(curvefit$residuals^2))
+
+dfm$logchla.c = predict(curvefit, new.data=dfm)
+
+par(mfrow=c(1,2))
+plot(dfm$logchla.p~log(dfm$chla), main="Acolite linear", xlab="log Measured monthly mean Chlorophyll a (ug/L)", ylab="log Predicted monthly mean Chlorophyll a (ug/L)",xlim=c(2,5.5),ylim=c(2.5,5.7))
+plot(dfm$logchla.c~log(dfm$chla), main="Acolite curve", xlab="log Measured mean monthly Chlorophyll a (ug/L)", ylab="log Predicted monthly mean Chlorophyll a (ug/L)",xlim=c(2,5.5),ylim=c(2.5,5.7))
+
+```
+
+While this does straighten the predictions, it seems to decrease predictability for median chlorophyll values. On the good side, overestimation seems much less of a problem for higher values.  
+
+Generally speaking, the residuals distribution is not exactly ideal, with a slight skewness, but the model's R2 goes up to approx 0.75.  
+
+# Overview of chlorophyll prediction model 
+
+Now, let's take a better look at the predicted values and their accuracy. In order to do that, we can look at MAE and RMSE for the different categories, aswell as how the different ponds differ in prediction performance.
+
+First, let's add the pond category variable, as provided by Eyerusalem.
+```{r adding Eyerusalems categories,message=F,warning=F}
+categories=read.csv("data/pond_categories_fixed.csv", sep=";")
+categories[,4:9]=NULL
+dfmc = left_join(dfm,categories, by="pond")
+```
+
+Since dfmc has a whooping 33 variables, let's reduce this a bit.
+
+```{r}
+dff=dfmc[,c(1,2,15,16,24,25,27,28,29,32,33)]
+dff$logchla.c=predict(curvefit, new.data=dff)
+dff$chla.p=exp(dff$logchla.c)
+```
+
+Now that dff has 13 variables, let's calculate the error for the whole dataset.
+
+```{r}
+# Function that returns Root Mean Squared Error
+rmse <- function(error)
+{sqrt(mean(error^2))}
+ 
+# Function that returns Mean Absolute Error
+mae <- function(error)
+{mean(abs(error))}
+
+# Calculate error
+error <- dff$chla - dff$chla.p
+
+paste("RMSE =", rmse(error))
+paste("MAE =", mae(error))
+
+```
+
+While, to me, this seems to be quite high, it is quite reasonnable considering the range of values observed in the system.  
+To further illustrate that point, let's look at the predicted vs observed scatterplot, including a 1:1 line and a loess smooth
+
+```{r, echo = FALSE}
+ggplot(dff, aes(x=chla, y=chla.p))+
+  geom_abline(slope=1, intercept=0, col="grey")+
+  geom_point()+
+  geom_smooth()+
+  geom_smooth(method=lm, se=F, col="red")+
+  xlim(0,225)+
+  ylim(0,225)+
+  annotate("text",x = 60, y = 200, label = "log(y) = 3.83 + 4.42b7 - 1.98b7^2 - 1.07b8 - 0.99b8^2 + 5.32c - 2.60c^2 + 2.40j - 0.62j^2")+
+  annotate("text",x = 20, y = 180, label = "R2 adj. = 0.67")+
+  annotate("text",x = 20, y = 160, label = "MAE = 24.51")+
+  annotate("text",x = 20, y = 140, label = "RMSE = 34.71")+
+  xlab("Measured Chl-a (ug/L)")+
+  ylab("Predicted Chl-a (ug/L)")+
+  ggtitle("Selected model for Chlorophyll-a prediction using S2 in ponds")+
+  theme_classic()
+
+write.csv(dff, "data/predicted_chla.csv") # so this data can be accessed easily
+```
+
+While the model seems to overestimate the data at lower concentrations and underestimate at higher concentrations, this is to be expected based on the different error factors such as submerged vegetation.
+
+Nonetheless, at very high values, underestimation isn't really an issue since jumping from 150 to 200 should not have much of a different ecological interpretation. On the other hand, at lower values, jumping from 5 to 25 does make the difference between oligo-mesotrophic water and meso-eutrophic water. (in North American terms at least (?))
+
+## Single pond predictions
+
+Let's look at the model's performance for single ponds, to see which ones seem to be better predicted, and which ones are worst.
+
+```{r, echo=FALSE}
+ggplot(dff, aes(x=chla, y=chla.p, col=pond))+
+  geom_abline(slope=1, intercept=0, col="grey")+
+  geom_point()+
+  geom_smooth(method=lm, se=F)+
+  xlim(0,225)+
+  ylim(0,225)+
+  xlab("Measured Chl-a ug/L")+
+  ylab("Predicted Chl-a ug/L")+
+  ggtitle("Selected model for Chlorophyll-a prediction using S2 in ponds")+
+  theme_classic()
+
+```
+
+```{r, echo=FALSE}
+ggplot(dff, aes(x=chla, y=chla.p, group=pond, col=pond))+
+  facet_wrap(~pond, scales="fixed")+
+  geom_abline(slope=1, intercept=0, col="grey")+
+  geom_point()+
+  geom_smooth(method=lm, se=F)+
+  # xlim(0,225)+
+  # ylim(0,225)+
+  xlab("Measured Chl-a ug/L")+
+  ylab("Predicted Chl-a ug/L")+
+  ggtitle("Selected model for Chlorophyll-a prediction using S2 in ponds")
+
+```
+
+Individually, it seems like a lot of ponds are having some trouble being predicted correctly, such as 1J3, K6, K9, M1, M10, M15
+
+Let's do the same exercice directly with categories
+
+```{r, echo=FALSE}
+ggplot(dff, aes(x=chla, y=chla.p, col=category))+
+  geom_abline(slope=1, intercept=0, col="grey")+
+  geom_point()+
+  geom_smooth(method=lm, se=F)+
+  xlim(0,225)+
+  ylim(0,225)+
+  xlab("Measured Chl-a ug/L")+
+  ylab("Predicted Chl-a ug/L")+
+  ggtitle("Selected model for Chlorophyll-a prediction using S2 in ponds")+
+  theme_classic()
+
+```
+
+```{r, echo=FALSE}
+ggplot(dff, aes(x=chla, y=chla.p, col=pond, group=category))+
+  facet_wrap(~category)+
+  geom_abline(slope=1, intercept=0, col="grey")+
+  geom_point()+
+  geom_smooth(method=lm, se=F)+
+  xlim(0,225)+
+  ylim(0,225)+
+  xlab("Measured Chl-a ug/L")+
+  ylab("Predicted Chl-a ug/L")+
+  ggtitle("Selected model for Chlorophyll-a prediction using S2 in ponds")+
+  theme_classic()
+
+```
+
+We see that the categories are very badly distributed, with much more data within the HCLM category than the others. I believe nothing much can be done about that (?) 
+
+let's look more in detail at the categories
+
+```{r hchm, echo=FALSE}
+hchm=subset(dff, dff$category=="hchm")
+
+ggplot(hchm, aes(x=chla, y=chla.p, col=pond))+
+  geom_abline(slope=1, intercept=0, col="grey")+
+  geom_point()+
+  geom_smooth(method=lm, se=F)+
+  xlim(0,225)+
+  ylim(0,225)+
+  xlab("Measured Chl-a ug/L")+
+  ylab("Predicted Chl-a ug/L")+
+  ggtitle("Chlorophyll-a prediction using S2 for HCHM ponds")+
+  theme_classic()
+```
+
+```{r hclm, echo=FALSE}
+hclm=subset(dff, dff$category=="hclm")
+
+ggplot(hclm, aes(x=chla, y=chla.p, col=pond))+
+  geom_abline(slope=1, intercept=0, col="grey")+
+  geom_point()+
+  geom_smooth(method=lm, se=F)+
+  xlim(0,225)+
+  ylim(0,225)+
+  xlab("Measured Chl-a ug/L")+
+  ylab("Predicted Chl-a ug/L")+
+  ggtitle("Chlorophyll-a prediction using S2 for HCLM ponds")+
+  theme_classic()
+```
+
+```{r lchm, echo=FALSE}
+lchm=subset(dff, dff$category=="lchm")
+
+ggplot(lchm, aes(x=chla, y=chla.p, col=pond))+
+  geom_abline(slope=1, intercept=0, col="grey")+
+  geom_point()+
+  geom_smooth(method=lm, se=F)+
+  xlim(0,75)+
+  ylim(0,75)+
+  xlab("Measured Chl-a ug/L")+
+  ylab("Predicted Chl-a ug/L")+
+  ggtitle("Chlorophyll-a prediction using S2 for LCHM ponds")+
+  theme_classic()
+```
+
+```{r lclm, echo=FALSE}
+lclm=subset(dff, dff$category=="lclm")
+
+ggplot(lclm, aes(x=chla, y=chla.p, col=pond))+
+  geom_abline(slope=1, intercept=0, col="grey")+
+  geom_point()+
+  geom_smooth(method=lm, se=F)+
+  xlim(0,75)+
+  ylim(0,75)+
+  xlab("Measured Chl-a ug/L")+
+  ylab("Predicted Chl-a ug/L")+
+  ggtitle("Chlorophyll-a prediction using S2 for LCLM ponds")+
+  theme_classic()
+```
+
+# seasonal trends in chlorophyll
+
+let's explore the predictions of the model
+
+```{r, echo=FALSE}
+ac_m$j <- ac_m$b5-((ac_m$b4+ac_m$b6)/2)
+ac_m$c <- ac_m$b3/ac_m$b4
+
+ac_m$p.chla=exp(predict(curvefit, ac_m))
+ac_m$date=ymd(ac_m$date)
+
+ac_m = ac_m %>% 
+  filter(p.chla<200)
+
+ggplot(ac_m, aes(x=date, y=p.chla, col=pond))+
+  geom_line()+
+  theme_minimal()+
+  theme(legend.position = "none")
+
+ggplot(ac_m, aes(x=date, y=p.chla, col=pond))+
+  geom_line()+
+  facet_wrap(~pond)+
+  theme_minimal()+
+  theme(legend.position = "none")
+```
+
+The seasonal trends seem to make sense, with the peaks being across the summer, and the lowest points being in the winter. Some of the less responsive ponds are the ones with the worst correlations in the model, such as 1J1 and V09.
+
+# mapping chlorophyll in ponds
+
+## map of sampled ponds
+
+The following maps are made with the 2015 data
+```{r sampled ponds, mesage=FALSE, warning=FALSE, echo=FALSE}
+
+sampled = readOGR("data/Sampled_ponds_ML.shp")
+sampled = spTransform(sampled, "+init=epsg:31370")
+sampled = spTransform(sampled, "+init=epsg:4326")
+sampled$area = round(sampled$area)
+
+centers = data.frame(gCentroid(sampled, byid = TRUE))
+centers$PondCode = sampled$PondCode
+
+
+leaflet() %>%
+  addProviderTiles("Stamen.Toner") %>%
+  addPolygons(data=sampled,
+              stroke = TRUE,
+              fillOpacity = 0.3,
+              #popup = paste("Area: ",sampled$area, "<br>"),
+              label = ~PondCode) %>%
+  addLabelOnlyMarkers(data = centers, # this part adds the permanent labels (and is optionnal)
+                      label = ~PondCode,
+                      lng =~x,
+                      lat =~y,
+                      labelOptions = labelOptions(noHide = TRUE,
+                                                  direction = 'center',
+                                                  textOnly = TRUE,
+                                                  style = list( "color" = "red",
+                                                                "font-size" = "15px",
+                                                                "font-weight" = "900",
+                                                                "text-shadow" = "-1px 0 white, 0 1px white, 1px 0 white, 0 -1px white"
+                                                  ))) 
+
+```
+
+```{r mean 2015 chlorophyll, include=FALSE}
+df15 = dff %>% group_by(pond) %>% summarise_at(vars(chla, chla.p), funs(mean)) %>% ungroup
+
+df15 = merge(sampled, df15, by.x = "PondCode" , by.y = "pond")
+df15$chla = round(df15$chla)
+df15$chla.p = round(df15$chla.p)
+
+mypal = colorNumeric(
+  palette = "RdYlGn",
+  domain  = df15$chla,
+  na.color = "black",
+  reverse = TRUE
+)
+
+leaflet() %>%
+  addProviderTiles("Stamen.Toner") %>%
+  addPolygons(data=df15,
+              stroke = FALSE,
+              fillOpacity = 0.8,
+              popup = paste("Area: ",sampled$area, "<br>", "Chl-a: ",df15$chla, "<br>", "p. Chl-a: ",df15$chla.p, "<br>"),
+              label = ~PondCode,
+              fillColor = ~mypal(chla)) %>%
+  addLegend("bottomright",
+            pal = mypal,
+            values = ~chla,
+            title = "Observed chla (ug/L)",
+            data = df15)
+
+```
+
+```{r mean 2015 predicted chlorophyll, echo=FALSE, include=FALSE}
+
+leaflet() %>%
+  addProviderTiles("Stamen.Toner") %>%
+  addPolygons(data=df15,
+              stroke = FALSE,
+              fillOpacity = 0.8,
+              popup = paste("Area: ",sampled$area, "<br>", "Chl-a: ",df15$chla, "<br>", "p. Chl-a: ",df15$chla.p, "<br>"),
+              label = ~PondCode,
+              fillColor = ~mypal(chla.p)) %>%
+  addLegend("bottomright",
+            pal = mypal,
+            values = ~chla,
+            title = "predicted chla (ug/L)",
+            data = df15)
+
+```
+
+```{r 2015 predicted observed, echo=FALSE, include=FALSE}
+library(htmlwidgets)
+df15$diff = (df15$chla.p-df15$chla)
+
+mypal2 = colorNumeric(
+  palette = "RdYlGn",
+  domain  = c(-50,50),
+  na.color = "grey",
+  reverse = FALSE
+)
+
+leaflet() %>%
+  addProviderTiles("Stamen.Toner") %>%
+  addPolygons(data=df15,
+              stroke = FALSE,
+              fillOpacity = 0.8,
+              popup = paste("Area: ",sampled$area, "<br>", "Chl-a: ",df15$chla, "<br>", "p. Chl-a: ",df15$chla.p, "<br>"),
+              label = ~PondCode,
+              fillColor = ~mypal2(diff)) %>%
+  addLegend("bottomright",
+            pal = mypal2,
+            values = c(-50,50),
+            title = "difference in chla (ug/L) (predicted - observed)",
+            data = df15)
+```
+
+```{r map widget with layers, echo=FALSE, fig.height=8, fig.width=8}
+map = leaflet() %>%
+  addTiles(group = "Base") %>%
+  
+  addProviderTiles("Stamen.Toner",
+                   group = "Base B&W") %>%
+  
+  addPolygons(data=df15,
+              stroke = FALSE,
+              fillOpacity = 0.8,
+              popup = paste("Area: ",sampled$area, "<br>", "Chl-a: ",df15$chla, "<br>", "p. Chl-a: ",df15$chla.p, "<br>"),
+              label = ~PondCode,
+              fillColor = ~mypal(chla),
+              group = "Observed Chl-a") %>%
+  addLegend("bottomright",
+            pal = mypal,
+            values = ~chla,
+            title = "Observed chla (ug/L)",
+            data = df15,
+            group = "Observed Chl-a") %>%
+  
+  addPolygons(data=df15,
+              stroke = FALSE,
+              fillOpacity = 0.8,
+              popup = paste("Area: ",sampled$area, "<br>", "Chl-a: ",df15$chla, "<br>", "p. Chl-a: ",df15$chla.p, "<br>"),
+              label = ~PondCode,
+              fillColor = ~mypal(chla.p),
+              group = "Predicted Chl-a") %>%
+  addLegend("bottomright",
+            pal = mypal,
+            values = ~chla,
+            title = "predicted chla (ug/L)",
+            data = df15,
+            group = "Predicted Chl-a") %>%
+  
+  addPolygons(data=df15,
+              stroke = FALSE,
+              fillOpacity = 0.8,
+              popup = paste("Area: ",sampled$area, "<br>", "Chl-a: ",df15$chla, "<br>", "p. Chl-a: ",df15$chla.p, "<br>"),
+              label = ~PondCode,
+              fillColor = ~mypal2(diff),
+              group = "diff. Chl-a") %>%
+  addLegend("bottomright",
+            pal = mypal2,
+            values = c(-50,50),
+            title = "difference in chla (ug/L) (predicted - observed)",
+            data = df15,
+            group = "diff. Chl-a") %>%
+  
+  addScaleBar(position = "bottomleft",
+              options  = scaleBarOptions(metric = TRUE, imperial = TRUE)) %>%
+  
+  addLayersControl(baseGroups    = c("Base","Base B&W"),
+                   overlayGroups = c("Observed Chl-a","Predicted Chl-a","diff. Chl-a"),
+                   options       = layersControlOptions(collapsed = TRUE)) %>%
+  
+  hideGroup(c("Predicted Chl-a","diff. Chl-a")) ; map
+
+```
+
+
+# distribution and cause of errors
+
+This section is mostly to understand the limits of our method. Most notably, submerged vegetation is known to be an issue but isn't explored previously. (it is an issue for chlorophyll prediction, and a goal for ecosystem monitoring). An interesting outcome would be a probability of presence, or "probable colonization intensity". something amongst those lines.  
+
+## submerged vegetation
+
+we can use:  
+
+- field survey estimates, altough they are quite limited
+
+- residuals from the model
+
+- within pond variance
+
+### H1; residuals vs field observations
+
+we can hypothesise that higher errors should happen at higher macrophyte biomass. That means we should expect a positive correlation between our model's residuals and the field estimates of macrophyte cover. (which is a very rough estimate)
+
+```{r field macrophytes estimates}
+hist(dff$sub.cover)
+```
+
+Knowing that the sub.cover variable is very approximative, an important thing to note is how our submerged vegetation cover estimations are distributed.
+
+```{r lm of sub.cover on residuals, message=F, warning=F, echo=F, fig.height=6, fig.width=6}
+library(GGally)
+colnames(dff)
+ggpairs(dff[,c(3:9,12,13)])
+```
+
+This shows that submerged vegetation cover has an existing but weak correlation with chlorophyll, phycocyanin, turbidity and possibly even the spectral ratios. 
+
+Since all those variables seem to be pretty colinear, let's use the model selector with all spectral information and chla to look for submerged vegetation
+
+```{r}
+initial_modelm=sub.cover~b2+b3+b4+b5+b6+b7+b8+b8a+b11+b12+b+c+d+e+f+g+h+i+j+chla
+dataset=dfmc
+
+modelm=model_selector(initial_modelm, dataset)
+
+fit_veg = lm(paste(attributes(modelm)$heading[6]),data=dfmc)
+summary(fit_veg)
+plot(fit_veg)
+hist(resid(fit_veg))
+
+dfmc$predicted_veg = predict(fit_veg, new.data=dfmc)
+
+plot(dfmc$predicted_veg~dfmc$sub.cover)
+```
+
+The data doesn't seem to be able to predict a reliable data for submerged vegetation. Let's look at the residuals from the chlorophyll prediction
+
+```{r, echo = F}
+fit=lm(logchla~logchla.c,data=dff)
+hist(resid(fit))
+
+plot(fit$residuals~dfmc$sub.cover)
+fit.res=lm(fit$residuals~dfmc$sub.cover)
+summary(fit.res)
+hist(resid(fit.res))
+```
+
+It seems our submerged vegetation cover estimate explains about 5% of the residuals distribution of the predicted chlorophyll and is not statistically significant at the 0.05 threshold. Nonetheless, there seems to be a tendency pointing towards a negative effect of submerged vegetation of residuals value. In this sense, chlorophyll would have a tendency of being overestimated at higher submerged vegetation cover.  
+Again, the observations are of low accuracy and the model not deemed significant.  
+
+Let's look at the general chlorophyll prediction residuals distribution.
+
+```{r residuals across categories, echo = F}
+dfmc$residuals=fit$residuals
+ggplot(dfmc, aes(x=category, y=residuals))+
+  geom_boxplot()+
+  geom_point()+
+  theme_classic()
+```
+
+The spread of the residuals is higher in LCHM than the other categories. and the residual values are higher in HM than in LM (probably not significant in HC.
+
+Low chlorophyll values seems to have a slight estimation bias towards overestimation, while high chlorophyll's error seem to be neutral for low macrophytes, and underestimated for high macrophytes. 
+
+This could also mean that for high chlorophyll values, submerged vegetation is not causing problems for the detection of chlorophyll (could be because of higher turbidity).  
+
+Let's look at lchm
+
+```{r, echo=F}
+ggplot(dfmc[which(dfmc$category=="lchm"),], aes(x=category, y=residuals))+
+  geom_boxplot()+
+  geom_point(aes(col=pond))+
+  theme_classic()
+```
+
+V09 and 1J1 both have very high residuals for low chlorophyll data
+
+```{r, echo=F}
+ggplot(dfmc, aes(x= reorder(pond, sub.cover), y=sub.cover))+
+  geom_boxplot()+
+  geom_point()+
+  theme_classic()
+```
+
+NOTE: turbidity and chlorophyll treshold between hclm and lclm could be investigated.  
+NOTE: The same type of analysis should be done for every individual pixels instead of means, as this might be spatially relevent.  
+
+#### Turbidity vs Chlorophyll vs residuals
+
+```{r}
+fit=lm(sneller~logchla, data=dfmc)
+summary(fit)
+plot(dfmc$sneller~dfmc$logchla)
+```
+
+Chlorophyll seems to be very directly correlated with turbidity, which is to be expected. In this case; how is turbidity related to residuals?
+
+```{r}
+fit=lm(residuals~sneller, data=dfmc)
+plot(dfmc$residuals~dfmc$sneller)
+summary(fit)
+hist(resid(fit))
+plot(fit)
+```
+
+The correlation between turbidity and residuals is higher than the submerged vegetation's estimate. (whilst it is still very low, it is significant)
+
+At lower turbidity, the residuals have a low variance, pointing towards an overestimation of chlorophyll a (could be related to higher submerged vegetation)  
+
+At high turbidity, the residuals have a higher variance, but mostly pointing towards an underestimation of chlorophyll a (probably related to the disparition of the submerged macrophytes signal) [residuals = observed - predicted]
+
+In terms of interpretation, I would believe this means that submerged vegetation might be less observable (/present?) at higher chlorophyll / turbidity values, BUT THIS SHOULD BE LOOKED AT MORE DEEPLY (POND PER POND, EVEN).  
+If this is true, it means that submerged vegetation detection and error is only relevant at lower chlorophyll values; in those ponds, it also appears that the residuals are much more spread, leading to an increase in variance.
+
+NOTES:  
+
+- We could try to establish a threshold/rule for which we can try to quantify submerged vegetation (???) still needs some reflections
+
+- Maybe the next step would be to apply this type of analysis pixel per pixel; then we can look into how intra pond variance is distributed accross the categories; based on those previous results, we should expect similar variance in all high chlorophyll ponds (no traces of submerged vegetation) and higher in lchm than in lclm. this could lead to a probability index for submerged vegetation in low turbidity ponds.... might be a long shot  
+
+
+This leads to H2 (spatial heterogeneity)
+
+### H2; spatial heterogeneity
+
+Another hypothesis would be that the presence of vegetation would lead to higher spatial heterogeneity of both the remote sensing signal and predicted chlorophyll. (based on the work in H1 that would be most visible at lower chl a values)  
+
+That also means the variance should go up along the growing season i.e. winter vs summer variance?  
+
+so: variance per pond and variance per month  
+
+to look at that we must go back to individual pixel values  
+
+```{r setting up heterogeneity dataset}
+dfh=acolite # dfh for dataframe heterogeneity will be our working dataframe for this part.
+#summary(bestfit) # this was the best model; we need to recall ratios b and c
+summary(curvefit) # this is the new version using polynomials
+dfh$b <- dfh$B3/dfh$B2
+dfh$c <- dfh$B3/dfh$B4
+
+unique(dfh$pond)
+
+dfh$logchla.c= predict(curvefit, newdata=dfh)
+dfh2=subset(dfh, dfh$logchla.c>0)
+dfh2$chlap=exp(dfh2$logchla.c)
+
+#now to add categories (maybe field data even? at some point?)
+dfh2 = right_join(dfh2, categories) #now we have every pixel per pond per date for every categories
+dfh2 = dfh2[complete.cases(dfh2),]
+
+hist(dfh2$logchla.c)
+hist(dfh2$chlap)
+
+summary(dfh2$logchla.c)
+
+```
+
+NOTE: Should the dataset be split seasonnally? for now, only the data from 2015 will be analysed
+
+```{r seasonal split?????}
+
+```
+
+```{r year split} 
+#because the categories might not be valid in the future years
+dfh2$date=ymd(dfh2$date)
+dfh2=subset(dfh2, dfh2$date < as.Date("2015-09-30"))
+```
+
+For 2015, let's look at spread of predicted values per dates per ponds category
+
+```{r summary variance statistics}
+
+dfh3 = dfh2 %>% group_by(date, pond) %>% summarise_at(vars(chlap, logchla.c), funs(mean,sd,var)) %>% ungroup(dfh2)
+dfh4 = right_join(dfh3, categories) #now we have every pixel per pond per date for every categories
+dfh4 = dfh4[complete.cases(dfh4),]
+
+```
+
+Plot ponds variance by categories
+
+```{r fig.width=15}
+#install.packages("cowplot")
+library(cowplot)
+
+#g1=ggplot(dfmc, aes(x=category, y=chla, col=pond))+
+#  geom_boxplot()+ theme(legend.position = "none")+
+#  ylim(0,225) + xlab("observed chla")
+
+g2=ggplot(dfh4, aes(x=category, y=chlap_mean))+
+  geom_boxplot()+ theme(legend.position = "none")+
+  ylim(0,225) + xlab("estimated chla")
+
+g3=ggplot(dfh4, aes(x=category, y=chlap_sd))+
+  geom_boxplot()+ theme(legend.position = "none") + xlab("estimated sd")
+
+g4=ggplot(dfh4, aes(x=category, y=chlap_var))+
+  geom_boxplot()+ theme(legend.position = "none") + xlab("estimated var")
+
+
+grid.arrange(g2,g3,g4, ncol=3)
+
+
+g2=ggplot(dfh4, aes(x=category, y=chlap_mean, col=pond))+
+  geom_boxplot()+ theme(legend.position = "none")+
+  ylim(0,225) + xlab("estimated chla")
+
+g3=ggplot(dfh4, aes(x=category, y=chlap_sd, col=pond))+
+  geom_boxplot()+ theme(legend.position = "none") + xlab("estimated sd")
+
+g4=ggplot(dfh4, aes(x=category, y=chlap_var, col=pond))+
+  geom_boxplot()+ theme(legend.position = "none") + xlab("estimated var")
+
+g5=ggplot(dfh4, aes(x=category, col=pond)) + geom_bar()
+legend=cowplot::get_legend(g5)
+
+grid.arrange(g2,g3,g4,legend, ncol=4)
+
+```
+
+According to previous plots, chlorophyll estimates seem to be very clustered for hchm within the ponds, but very distant within the category. Also, by looking at standard deviation and variance, we see that while most values are very clustered, the standard deviation and variance are very high, probably because of some extreme values that could well be associated with vegetation. This makes it difficult to accept or reject the hypothesis about high chlorophyll leading to more homegenous values. Plus, hclm seems to be the most unstable group, with very high spread all around, which contradicts the hypothesis that high chlorophyll prevents the detection of intrapond variations.  
+
+In terms of general variance, lchm is the lowest, with lclm, although one pond (1J3) seems to cause big problems for lclm.
+This also contradicts our hypothesis.
+
+*Note*: The predictive model is fitted on mean monthly pond data, can it be expected to hold when applied to individual pixels? (the fact that they had to be subsetted to remove negative values is a sign that it might be a problem)
+
+Also, negative values were removed, but there was a significant number of them.
+
+### (test) H3; chloropyll and turbidity together might explain macrophytes cover
+
+```{r}
+fit=lm(logchla~logchla.c*sneller,data=dfmc)
+summary(fit) # chlorophyll seems to be the only significant variable...
+hist(resid(fit))
+plot(fit)
+
+plot(fit$residuals~dfmc$sub.cover)
+fit.res=lm(fit$residuals~dfmc$sub.cover)
+summary(fit.res)
+hist(resid(fit.res))
+
+```
+
+This is too weak to be of any use.
+
+### (test) H4; model selector for submerged vegetation
+
+```{r}
+initial_modelm=sub.cover~b2+b3+b4+b5+b6+b7+b8+b8a+b11+b12+b+c+d+e+f+g+h+i+j
+dataset=dfmc
+
+modelm=model_selector(initial_modelm, dataset)
+
+fitm=lm(paste0(attributes(modelm)$heading[6]),data=dfmc)
+summary(fitm)
+hist(resid(fitm))
+plot(fitm)
+# this looks like it could benefir from a polynomial fit
+
+fitmc=lm(sub.cover~poly(b5,2)+poly(b8,2)+poly(c,2), data=dfmc)
+summary(fitmc)
+hist(resid(fitmc)) #the weirdly distributed
+plot(fitmc) # scale location and residuals distribution is still very bad
+
+dfmc$predicted.veg=predict(fitmc, new.data = dfmc)
+plot(dfmc$predicted.veg~dfmc$sub.cover)
+
+# best case scenario, it seems we can predict about 50% of our estimates for submerged vegetation.
+
+dfmc$res.veg=resid(fitmc)
+
+ggplot(dfmc, aes(x=category, y=residuals))+
+  geom_boxplot() # no strong tendencies, although slight underestimations occur at hchm, but it could be expected since it's the high range.
+```
+
+still not very useful.
+
+# Overview of the best model after validations
+
+According to my tests, I don't think we have much of a grasp to go into the analysis of submerged vegetation with our current data.
+
+On the other hand, chlorophyll predictions seem to be quite good and robust when looking at the polynomial version of the best linear fitted model. Let's calculate it's global RMSE and MAE and plot the final result.
+

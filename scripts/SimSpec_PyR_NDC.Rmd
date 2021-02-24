@@ -1,0 +1,315 @@
+---
+title: "SimSpec_pyR_NDC"
+author: "Arthur de Grandpré"
+date: "19 juillet 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+rm(list=ls())
+gc()
+
+library(ncdf4)
+library(raster)
+library(sf)
+library(raster)
+library(rgdal)
+library(rgeos)
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(parallel)
+library(snowfall)
+```
+
+Nic's original workflow :  
+Load S2A and S2B data separately, separate water and land pixels, apply simspec correction on a per pixel basis, based on an empirical ratio for each satellite, and calibrated to bands 865 and 783
+
+What we have : 
+from the NC files, land, water and vegetation are already separated, but the extraction got rid of the land pixels.
+
+In order to match the workflows, we have to combine the simspec with our extraction and masking steps
+
+
+```{r}
+path_nc = "D:/nic_transfer/" # path to all .nc files
+ncdir = dir(path_nc, pattern=".nc$")
+
+path_poly = "./data/mask_nic_20191126/" # path to all ponds .shp files
+polydir = dir(path_poly, pattern=".shp$")
+
+# Assuming that all the .nc files will be structured in the same way, run this loop and voila :) 
+
+nc_extract_simspec = function(x,ncdir,polydir){
+# 
+# x=1
+# print(paste0("image ",i," out of ",length(ncdir)))
+nc = nc_open(paste0(path_nc,ncdir[x]))
+# nc1 # summary of the netcdf dataset
+
+nc_proj4 = ncatt_get(nc,0, "proj4_string")$value
+nc_res = ncatt_get(nc,0, "pixel_size")$value
+nc_extent_x = ncatt_get(nc,0, "xrange")$value
+nc_extent_y = ncatt_get(nc,0, "yrange")$value
+
+var_names = attributes(nc$var)$names
+bands = grep("^rhos",var_names, value=T)
+
+r = raster()
+for(b in 1:length(bands)){
+  r = stack(r, raster(t(ncvar_get(nc, bands[b]))))
+}
+
+if(is.na(getValues(r[[1]])[1])==T){
+  print(paste0("empty raster at ",x))
+  next
+}
+
+r = brick(r)
+extent(r) = c(nc_extent_x,nc_extent_y)
+res(r) = nc_res
+proj4string(r) = nc_proj4
+names(r) = bands
+
+r = projectRaster(r, crs="+init=epsg:4326")
+output_df=data.frame()
+for(j in 1:length(polydir)){
+# j=1
+  poly = st_read(paste0(path_poly,polydir[j]), quiet=T)
+  
+  cr = crop(r,poly)
+  mr = mask(cr, poly)
+  rmr = mask(r, poly, inverse=T)
+  
+  envs = c()
+  for(b in 1:nlayers(rmr)){
+  envs=append(envs, mean(getValues(rmr[[b]]),na.rm=T)) 
+  }
+  rm(rmr);rm(cr)
+  
+  landm865 = envs[9]
+  landm783 = envs[7]
+  
+  dfmr = as.data.frame(mr, xy=T)
+  dfmr = dfmr[complete.cases(dfmr),]
+  dfmr$date = substr(ncdir[x],9,18)
+  dfmr$satellite = substr(ncdir[x],1,3)
+  dfmr$pond = gsub("_Polygon.shp","",polydir[j])
+  
+  class = apply(dfmr,1, function(x){
+    if(x[4]>0.2){return("clouds")}else{
+    if(x[10]>0.08){return("vegetation")}else{
+    return("water")
+  }}})
+  
+  # ggplot(dfmr, aes(x=class))+
+  #   geom_bar()
+  
+  dfmr = cbind(dfmr,class)
+  
+  if("water" %in% unique(dfmr$class)){
+    dfmrw = subset(dfmr, dfmr$class=="water")
+    colnames(dfmrw) = colnames(dfmr)
+    dfmrw$sol=NA
+    
+    for(k in 1:dim(dfmrw)[1]){
+      tdf = dfmrw[k,]
+      s2ac = 0.81936292024314039
+      s2bc = 0.8296305320098123
+      
+      optif = function(x){
+        tv = (tdf$rhos_865-x*landm865)/(tdf$rhos_783-x*landm783)
+        if(tdf$satellite=="S2A"){
+          return(abs(tv-s2ac))}else{
+            return(abs(tv-s2bc))}
+      }
+      
+      sol = optim(0,
+                  optif,
+                  lower = 0,
+                  upper = 1)
+      
+      dfmrw[k,ncol(dfmrw)] = sol$par
+    }
+    
+    dfc = dfmrw[,3:13]
+    for(i2 in 1:ncol(dfc)){
+      dfc[,i2]=dfc[,i2]-dfmrw[,18]*envs[i2]
+    }
+    
+    dfc2 = dfmrw[,1:17]
+    dfc2[,3:13]=dfc
+    
+    dfmr2 = subset(dfmr, dfmr$class=="vegetation")
+    dfmr2 = rbind(dfmr2,dfc2)
+    dfmr  = dfmr2
+  }
+  output_df=rbind(output_df,dfmr)
+}
+  colnames(output_df)=colnames(dfmr)
+  write.csv(output_df, paste0("D:/Data/simspec2020/",x,"_nc_extract_simspec.csv"))
+}
+
+
+sfInit(parallel=TRUE, cpus=parallel::detectCores())
+sfExport("ncdir","polydir","nc_extract_simspec","path_nc","path_poly")
+sfLibrary(rgdal)
+sfLibrary(ncdf4)
+sfLibrary(raster)
+sfLibrary(sp)
+sfLibrary(sf)
+
+out.lst = sfClusterApplyLB(1:length(ncdir),
+                           function(x){nc_extract_simspec(x,ncdir,polydir)})
+
+sfStop()
+
+```
+
+```{r}
+csvs = dir("D:/Data/simspec2020/",pattern=".csv*",full.names=T)
+# install.packages("vroom")
+library(vroom)
+df = vroom(csvs, col_names=F, skip=1)
+
+dft = read.csv(csvs[1])
+colnames(df)=colnames(dft)
+
+write.csv(df, "./data/simspec2020.csv")
+```
+
+
+# VALIDATION
+
+```{r}
+library(leaflet)
+
+path_nc = "D:/nic_transfer/" # path to all .nc files
+ncdir = dir(path_nc, pattern=".nc$")
+
+path_poly = "./data/mask_nic_20191126/" # path to all ponds .shp files
+polydir = dir(path_poly, pattern=".shp$")
+
+# Assuming that all the .nc files will be structured in the same way, run this loop and voila :) 
+
+x=9
+
+print(paste0("image ",x," out of ",length(ncdir)))
+nc = nc_open(paste0(path_nc,ncdir[x]))
+# nc1 # summary of the netcdf dataset
+
+nc_proj4 = ncatt_get(nc,0, "proj4_string")$value
+nc_res = ncatt_get(nc,0, "pixel_size")$value
+nc_extent_x = ncatt_get(nc,0, "xrange")$value
+nc_extent_y = ncatt_get(nc,0, "yrange")$value
+
+var_names = attributes(nc$var)$names
+bands = grep("^rhos",var_names, value=T)
+
+r = raster()
+for(b in 1:length(bands)){
+  r = stack(r, raster(t(ncvar_get(nc, bands[b]))))
+}
+
+if(is.na(getValues(r[[1]])[1])==T){
+  print(paste0("empty raster at ",x))
+  next
+}
+
+r = brick(r)
+extent(r) = c(nc_extent_x,nc_extent_y)
+res(r) = nc_res
+proj4string(r) = nc_proj4
+names(r) = bands
+
+r = projectRaster(r, crs="+init=epsg:4326")
+
+j=1
+
+poly1 = st_read(paste0(path_poly,polydir[j]), quiet=T)
+poly2 = st_read(paste0(path_poly,polydir[j+1]), quiet=T)
+poly3 = st_read(paste0(path_poly,polydir[j+2]), quiet=T)
+
+leaflet() %>% 
+  addTiles() %>% 
+  addRasterImage(r[[4]]) %>% 
+  addPolygons(data=poly1) %>% 
+  addPolygons(data=poly2) %>% 
+  addPolygons(data=poly3)
+
+```
+
+```{r}
+
+df = read.csv("./data/simspec2020.csv")
+df$date = ymd(df$date)
+
+x1 = ymd(substr(sub(".*MSI_","",ncdir),start=1,stop=10)[x])
+
+d1 = df %>%
+  filter(df$date==x1) %>% 
+  st_as_sf(coords = c("x","y"),
+           crs = "+init=epsg:4326")
+
+library(leaflet)
+
+pal1 = colorNumeric(
+  palette = "RdYlGn",
+  domain = d1$rhos_833
+)
+# 
+# leaflet(d1) %>%
+#   addTiles() %>% 
+#   addCircleMarkers(stroke = F,
+#                    fillColor=~pal1(rhos_833),
+#                    fillOpacity = 0.5) %>%
+#   addLegend("bottomright",
+#             pal=pal,
+#             values=~rhos_833,
+#             title= "NIR reflectance")
+
+
+# Create a palette that maps factor levels to colors
+pal2 <- colorFactor(c("white","red","navy"), domain = c("water","vegetation","clouds"))
+
+leaflet(d1) %>%
+  
+  addTiles(
+    group = "base OSM") %>%
+  
+  addCircleMarkers(
+    color = ~pal2(class),
+    stroke = FALSE, fillOpacity = 0.5,
+    group = "classes") %>% 
+  
+  addLegend(
+    "bottomright",
+    pal = pal2,
+    values = ~class,
+    title = "classes",
+    group = "classes") %>% 
+  
+  addCircleMarkers(
+    stroke = F,
+    fillColor = ~pal1(rhos_833),
+    fillOpacity = 0.5,
+    group = "NIR") %>% 
+  
+  addLegend(
+    "bottomright",
+    pal = pal1,
+    values = ~rhos_833,
+    title = "NIR reflectance",
+    group = "NIR") %>% 
+  
+  addRasterImage(
+    r[[8]],
+    group = "base NIR") %>% 
+  
+  addLayersControl(
+    baseGroups = c("base OSM"),
+    overlayGroups = c("classes", "NIR", "base NIR"),
+    options = layersControlOptions(collapsed = FALSE))
+  
+```
+

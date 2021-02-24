@@ -1,0 +1,227 @@
+---
+title: "water mask"
+author: "Arthur de Grandpré"
+date: "18 mai 2020"
+output: html_document
+---
+
+```{r setup}
+
+rm(list=ls())
+
+library(raster)
+library(rgdal)
+# library(rgeos)
+library(sf)
+library(leaflet)
+library(mapview)
+library(tidyverse)
+library(lubridate)
+library(zoo)
+```
+
+
+# Data validation
+
+Let's load the better fitted data as of the .nc files extraction, look at it's structure and format it conveniently.
+
+```{r read_data}
+df = read.csv("./data/nc_extract.csv")
+summary(df)
+df[,1]=NULL
+df$date = lubridate::ymd(df$date)
+colnames(df) = c("x","y","b1","b2","b3","b4","b5","b6","b7","b8","b8a","b11","b12","date","satellite","pond")
+
+sfd = sf::st_as_sf(df, coords = c("x","y"))
+sfd = st_set_crs(sfd, 4326)
+```
+
+Now let's visualize one date to make sure the data fits ok
+
+```{r spatialfit_validation}
+d1 = sfd[sfd$date==unique(sfd$date)[1],]
+plot(d1[1],main=paste0("test: B8 on ",d1$date[1]))
+
+pal = colorNumeric(
+  palette = "RdYlGn",
+  domain = d1$b8
+)
+
+leaflet(d1) %>%
+  addTiles() %>% 
+  addCircleMarkers(stroke = F,
+                   fillColor = ~pal(b8),
+                   fillOpacity = 0.5,
+                   radius = 8) 
+
+```
+
+And let's see if all the dates seem good
+
+```{r npixel_validation}
+
+val_df = sfd %>% group_by(date,pond) %>% summarise(frequency = n()) %>% ungroup
+
+ggplot(val_df, aes(x=date, y=frequency, group=pond)) +
+  geom_point()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  facet_wrap(~pond)
+
+
+```
+
+The pond coverage appears to be good, aswell as the amount of pixel over time.
+
+
+# Data filtering
+
+Before using the data for modelling, the pixels must be classified and filtered in order to exclude bad or terrestrial data.
+
+## cloud and vegetation filtering
+
+While bands 10 and 9 would be the best for cloud discrimination, we do not have them. Bands below 700nm should also work (bands 1 to 4).  
+
+Our previous applications have used a cloud_mask of 0.3 on band 2 (blue).
+
+Since the base signal of every picture was quite different, vegetation masking will be using the NDVI ratio (more robust to such differences)
+
+Based on Nic's thesis, we should be able to use an NDVI treshold of 0, but this results in way too much vegetation. 0.4 or 0.5 seems more reasonnable.
+
+Based on previous acolite modeling scripts, a NIR based mask of 0.1 was also used. We will try this mask.
+
+```{r}
+cloud_treshold = 0.3
+vegetation_treshold = 0.08
+
+sfd$ndvi = (sfd$b8-sfd$b4)/(sfd$b8+sfd$b4)
+
+sfd$class = ifelse(sfd$b2 < cloud_treshold,
+                   ifelse(sfd$b8 > vegetation_treshold,
+                          "vegetation",
+                          "water"),
+                   "cloud")
+
+ggplot(sfd, aes(x=class)) +
+  geom_bar()
+summary(sfd$class)
+
+sfd %>%
+  group_by(class) %>%
+  summarise(no_rows = length(class))
+
+hist(sfd$b2)
+hist(sfd$b8)
+hist(sfd$ndvi)
+
+wdf = sfd %>% filter(class == "water")
+wdf = st_drop_geometry(wdf)
+write.csv(wdf, "./data/water_pixels.csv")
+```
+
+let's look into b8 values for a given date
+
+```{r spatialfit_validation}
+i=1
+d1 = sfd[sfd$date==unique(sfd$date)[i],]
+plot(d1[8],main=paste0("test: B8 on ",d1$date[i]))
+
+pal = colorNumeric(
+  palette = "RdYlGn",
+  domain = d1$b8
+)
+
+leaflet(d1) %>%
+  addTiles() %>% 
+  addCircleMarkers(stroke = F,
+                   fillColor = ~pal(b8),
+                   fillOpacity = 0.5,
+                   radius = 8) %>% 
+  addLegend(pal = pal, values = as.numeric(0:1), title = "B8")
+```
+
+This seems to leave a reasonnable amount of data to work with.
+
+```{r}
+val_df = sfd %>%
+  filter(class=="water") %>% 
+  group_by(date,pond) %>%
+  summarise(frequency = n()) %>%
+  ungroup
+
+ggplot(val_df, aes(x=date, y=frequency, group=pond)) +
+  geom_point()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  facet_wrap(~pond)
+
+```
+
+
+# missing data interpolation / vegetation estimates
+
+Since so much of the data is missing, cloud data will be interpolated linearly in order to fill some of the smaller gaps. This interpolation will not be used for the actual chlorophyll model, but only for emerged vegetation monitoring, since it should be much more stable.
+
+```{r}
+sfd2 = sfd
+sfd2 = sfd2 %>% 
+  mutate_at(vars(c(1:11,15)), funs(ifelse(class=="cloud",NA,.)))
+sfd2$x = st_coordinates(sfd2)[,1]
+sfd2$y = st_coordinates(sfd2)[,2]
+sfd2$xy = paste0(sfd2$x,"_",sfd2$y)
+df3 = st_drop_geometry(sfd2)
+# need one column per XY coordinate per band, one line per date, and then fill NAs using previous known values
+
+df3s = df3 %>% 
+  filter(xy==unique(xy[1])) %>% 
+  mutate(date, lubridate::ymd(date)) %>% 
+  arrange(date)
+  
+df3s[,1:11] = na.locf(df3s[,1:11], maxgap=4, na.rm=FALSE)
+  
+for(i in 2:length(unique(df3$xy))){
+  print(paste0("point ",i," out of ",length(unique(df3$xy))))
+  df3si = df3 %>% 
+    filter(xy==unique(xy[i])) %>% 
+    mutate(date, lubridate::ymd(date)) %>% 
+    arrange(date)
+  
+  df3si[,1:11] = na.locf(df3si[,1:11], maxgap=4, na.rm=FALSE)
+  df3s=rbind(df3s,df3si)
+}
+
+df3c = df3s
+
+df3c$ndvi = (df3c$b8-df3c$b4)/(df3c$b8+df3c$b4)
+
+summary(df3c)
+unique(df3c$class)
+df3c$class = ifelse(df3c$b2 < cloud_treshold,
+                   ifelse(df3c$b8 > vegetation_treshold,
+                          "vegetation",
+                          "water"),
+                   "cloud")
+
+df3c = df3c[complete.cases(df3c),]
+
+ggplot(df3c, aes(x=class)) +
+  geom_bar()
+
+edf1 = df3c %>% group_by (pond, date, class) %>%
+  summarise(pixels = n()) %>%
+  ungroup()
+
+edf2 = df3c %>% group_by (pond, date) %>% 
+  summarise(tot_pixels = n()) %>% 
+  ungroup()
+
+edf3 = left_join(edf1,edf2) %>% 
+  filter(class == "vegetation") %>% 
+  mutate(em_veg = pixels/tot_pixels)
+
+ggplot(edf3, aes(x=date, y=em_veg, group=pond)) +
+  geom_point()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  facet_wrap(~pond)
+
+write.csv(edf3, "./data/emerging_vegetation.csv")
+```
+

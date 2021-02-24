@@ -1,0 +1,695 @@
+---
+title: "water_veg_mask"
+author: "Arthur de Grandpré"
+date: "17 novembre 2019"
+output: html_document
+---
+
+```{r setup}
+
+rm(list=ls())
+
+library(raster)
+library(rgdal)
+library(rgeos)
+library(sf)
+library(leaflet)
+library(mapview)
+
+```
+
+```{r load images}
+
+# where to find the images
+s2_ac_dir = "data/heavy"
+s2_ac_imgs = dir(s2_ac_dir, pattern = ".tif$", recursive=T)
+s2_ac_img = paste0(s2_ac_dir,"/",s2_ac_imgs[1])
+
+# the images CRS according to SNAP
+WGS84_31N = "+init=epsg:32631"
+
+# loading the raster
+r = brick(s2_ac_img)
+r
+# setting the right layer names
+layers = c("x",
+           "y",
+           "443",
+           "492",
+           "560",
+           "665",
+           "704",
+           "740",
+           "783",
+           "833",
+           "865",
+           "1614",
+           "2202")
+names(r) = layers
+r = dropLayer(r, c("x","y"))
+r = r/255
+plot(r)
+
+```
+
+```{r subset image}
+
+#mapRGB = viewRGB(r, 4,3,2, quantiles = c(0.05,0.95))
+#subset = drawFeatures(map = mapRGB)
+#st_write(subset, "data/pond_area.gpkg", layer="sub_extent", driver ="GPKG")
+subset = st_read("data/pond_area.gpkg")
+rs = crop(r, extent(subset))
+
+```
+
+# Pond masking validation (extra)
+
+Since the masking seems to perform very badly, let's look at the polygon masks used to subset the ponds from the rasters
+
+```{r}
+library(rgdal)
+library(raster)
+rm = trim(raster(paste0("./data/mask_nic_20191126/",dir("./data/mask_nic_20191126/", pattern=".tif$")[1])))
+rm2 = rasterToPolygons(rm,dissolve=T)
+rm3 = spTransform(rm2, CRS("+init=epsg:4326"))
+plot(rm3)
+
+rm4 = readOGR(paste0("./data/mask_nic_20191126/",dir("./data/mask_nic_20191126/", pattern=".shp$")[1]))
+```
+
+
+```{r visualise image}
+
+library(mapedit)
+library(leaflet)
+
+val = as.numeric(c(0:1))
+pal = colorNumeric("RdYlGn",val)
+
+map = leaflet() %>%
+  addTiles() %>% 
+  addRasterImage(rs$X833,
+                 colors = pal,
+                 opacity = 0.5,
+                 group="B8") %>% 
+  addPolygons(data=rm4, group="tif") %>% 
+  addPolygons(data=rm3, group="shp") %>% 
+  addLayersControl(overlayGroups=c("B8","tif","shp"))
+map
+
+library(htmlwidgets)
+saveWidget(map, "fit_test_pond.html", selfcontained = T)
+
+options(mapviewMaxPixels = 1000000)
+
+comp = viewRGB(rs, 4,3,2, quantiles = c(0.01, 0.9))
+comp
+
+```
+
+there is a big gap between the polygons and the actual ponds. it seems to be from the .nc file, maybe when it is transformed into .tiff  
+   
+let's try to read the netcdf file directly
+```{r eval=FALSE, include=FALSE}
+#install.packages("RNetCDF")
+rm(list=ls())
+path = "./data/heavy/wetransfer-e8e5fa/"
+ncdir = dir(path, pattern=".nc$")
+ library(RNetCDF)
+ nc1 = read.nc(paste0(path,ncdir[1]))
+### seems like it's not a true netcdf file, probably hdf5
+
+# install.packages("BiocManager")
+# BiocManager::install("rhdf5")
+
+library(rhdf5)
+
+h5_index = h5ls(paste0(path,ncdir[1]), all=T)
+
+h5_index$name
+dfrnc1 = cbind(as.vector(h5read(paste0(path,ncdir[1]), name=h5_index$name[3])),
+               as.vector(h5read(paste0(path,ncdir[1]), name=h5_index$name[2])),
+               as.vector(h5read(paste0(path,ncdir[1]), name=h5_index$name[6])),
+               as.vector(h5read(paste0(path,ncdir[1]), name=h5_index$name[7])),
+               as.vector(h5read(paste0(path,ncdir[1]), name=h5_index$name[8])),
+               as.vector(h5read(paste0(path,ncdir[1]), name=h5_index$name[9])),
+               as.vector(h5read(paste0(path,ncdir[1]), name=h5_index$name[10])),
+               as.vector(h5read(paste0(path,ncdir[1]), name=h5_index$name[11])),
+               as.vector(h5read(paste0(path,ncdir[1]), name=h5_index$name[12])),
+               as.vector(h5read(paste0(path,ncdir[1]), name=h5_index$name[13])),
+               as.vector(h5read(paste0(path,ncdir[1]), name=h5_index$name[14])),
+               as.vector(h5read(paste0(path,ncdir[1]), name=h5_index$name[4])),
+               as.vector(h5read(paste0(path,ncdir[1]), name=h5_index$name[5])))
+
+head(dfrnc1)
+write.csv(dfrnc1, "./data/heavy/nc1.csv")
+
+library(raster)
+rasterOptions(tmpdir="D:/Rtemp")
+rasterOptions(progress="window")
+rasterOptions(timer=T)
+rasterOptions(todisk=T)
+# writeRaster(rasterFromXYZ(read.csv("./data/heavy/nc1.csv")), filename(".data/heavy/nc1.tif"),format="GTiff") This solution is way too long
+
+lonr = raster(t(h5read(paste0(path,ncdir[1]), name=h5_index$name[3])))
+latr = raster(t(h5read(paste0(path,ncdir[1]), name=h5_index$name[2])))
+
+rt1 = raster(t(h5read(paste0(path,ncdir[1]), name=h5_index$name[13])))
+
+
+rsnap = rt1
+
+extent(rt1) = c(lonr@data@min,lonr@data@max,latr@data@min,latr@data@max)
+res(rt1) = c((lonr@data@max-lonr@data@min)/lonr@ncols,(latr@data@max-latr@data@min)/lonr@nrows)
+crs(rt1) = CRS("+init=epsg:4326")
+library(leaflet)
+library(sp)
+library(rgdal)
+
+rm4 = readOGR(paste0("./data/mask_nic_20191126/",dir("./data/mask_nic_20191126/", pattern=".shp$")[1]))
+
+tif_r = raster(paste0("./data/crop_rasters/",dir("./data/crop_rasters/")[1]), band=8)
+tif_r
+
+extent(rsnap) = c(654900,675540,5644440,5656200)
+res(rsnap) =c(10,10)
+crs(rsnap) = CRS("+proj=utm +zone=31 +datum=WGS84 +units=m +no_defs")
+rsnap
+
+rsnapg = projectRaster(rsnap, crs="+init=epsg:4326")
+
+map = leaflet() %>% 
+  addTiles() %>% 
+  addRasterImage(rt1,
+                 opacity=1,
+                 group = "raster_nc") %>%
+  addRasterImage(tif_r,
+                 opacity=1,
+                 group = "raster_tif") %>%
+  addRasterImage(rsnapg,
+                 opacity=1,
+                 group = "snap_manual") %>% 
+  addPolygons(data=rm4,
+              group = "polygon") %>% 
+  addLayersControl("topleft", overlayGroups = c("polygon","raster_nc","raster_tif","snap_manual")) ; map
+library(htmlwidgets)
+saveWidget(map,"map_tif_nc_snap_polygon.html",selfcontained=T)
+rt1
+rasterOptions(todisk=F)
+h5closeAll()
+```
+
+The last chunck is very chaotic because of multiple attemps, but the data is in fact a WGS84 UTM 31N grid and the metadata is available in the SNAP software, but not visible in R ... using the contained lat lon data doesnt give a proper geolocation, nor the SNAP exported tif files. Thus, we need to access the metadata from within R and manually project this data. Let's try to do this in a clean way.
+
+```{r}
+library(ncdf4)
+rm(list=ls())
+path = "./data/heavy/wetransfer-e8e5fa/"
+ncdir = dir(path, pattern=".nc$")
+
+nc = nc_open(paste0(path,ncdir[1]))
+# nc1 # summary of the netcdf dataset
+
+nc_proj4 = ncatt_get(nc,0, "proj4_string")$value
+nc_res = ncatt_get(nc,0, "pixel_size")$value
+nc_extent_x = ncatt_get(nc,0, "xrange")$value
+nc_extent_y = ncatt_get(nc,0, "yrange")$value
+
+var_names = attributes(nc$var)$names
+bands = grep("^rhos",var_names, value=T)
+
+r = raster()
+for(i in 1:length(bands)){
+r = stack(r, raster(t(ncvar_get(nc, bands[i]))))
+}
+r = brick(r)
+
+extent(r) = c(nc_extent_x,nc_extent_y)
+res(r) = nc_res
+proj4string(r) = nc_proj4
+names(r) = bands
+
+rp = projectRaster(r, crs="+init=epsg:4326")
+writeRaster(rp, paste0("./data/heavy/"))
+#  leaflet() %>% 
+#    addTiles() %>% 
+#    addRasterImage(rp$rhos_833)
+
+```
+
+
+```{r polygon library drawing}
+
+# some_clouds = mapedit::drawFeatures(map = comp)
+# st_write(some_clouds, "data/training_features.gpkg", layer="clouds", driver = "GPKG", delete_layer = T)
+
+# some_ponds = mapedit::drawFeatures(map = comp)
+# st_write(some_ponds, "data/training_features.gpkg", layer="ponds", driver ="GPKG", delete_layer = T)
+
+# some_urban = mapedit::drawFeatures(map = comp)
+# st_write(some_urban, "data/training_features.gpkg", layer="urban", driver ="GPKG", delete_layer = T)
+
+# some_forest = mapedit::drawFeatures(map = comp)
+# st_write(some_forest, "data/training_features.gpkg", layer="forest", driver ="GPKG")
+
+# some_fields = mapedit::drawFeatures(map = comp)
+# st_write(some_fields, "data/training_features.gpkg", layer="fields", driver ="GPKG")
+
+# some_water = mapedit::drawFeatures(map = comp)
+# st_write(some_water, "data/training_features.gpkg", layer="water", driver ="GPKG")
+
+ # some_veg = mapedit::drawFeatures(map = comp)
+ # st_write(some_veg, "data/training_features.gpkg", layer="veg", driver ="GPKG")
+
+```
+
+```{r polygon library reading}
+
+st_layers("data/training_features.gpkg")
+
+veg = st_read("data/training_features.gpkg", "veg")
+water = st_read("data/training_features.gpkg", "water")
+
+comp_w = addFeatures(comp, data=water)
+comp_wv = addFeatures(comp_w, data=veg)
+comp_wv
+
+```
+
+```{r single image value comparison}
+
+water_r = mask(rs, water)
+veg_r = mask(rs, veg)
+
+dev.off()
+boxplot(veg_r, main = "veg", col = "green", notch = T)
+boxplot(water_r, main = "water", col = "blue", add = T, notch = T)
+
+hist(veg_r)
+hist(water_r)
+
+```
+
+```{r multiple image fit}
+
+for(i in 1:length(s2_ac_imgs)) {
+s2_ac_img = paste0(s2_ac_dir,"/",s2_ac_imgs[i])
+
+# loading the raster
+r = brick(s2_ac_img)
+
+# setting the right layer names
+layers = c("x",
+           "y",
+           "443",
+           "492",
+           "560",
+           "665",
+           "704",
+           "740",
+           "783",
+           "833",
+           "865",
+           "1614",
+           "2202")
+names(r) = layers
+r = dropLayer(r, c("x","y"))
+r = r/255
+
+subset = st_read("data/pond_area.gpkg")
+rs = crop(r, extent(subset))
+
+writeRaster(rs, paste0("data/crop_rasters/",gsub(".*fa/","",s2_ac_img)), format="GTiff")    
+}
+
+```
+
+```{r multiple raster view}
+crops = dir("data/crop_rasters/", patter=".tif$")
+
+val = c(0,1)
+pal = colorNumeric("RdYlGn",
+                   val,
+                   na.color = "transparent")
+
+leaflet() %>% 
+  
+  addRasterImage(raster(paste0("data/crop_rasters/",crops[1]),band=4),
+                 col = pal, group = "r1") %>% 
+  
+  addRasterImage(raster(paste0("data/crop_rasters/",crops[2]),band=4),
+                 col = pal, group = "r2") %>% 
+  
+  addRasterImage(raster(paste0("data/crop_rasters/",crops[3]),band=4),
+                 col = pal, group = "r3") %>% 
+  
+  addRasterImage(raster(paste0("data/crop_rasters/",crops[4]),band=4),
+                 col = pal, group = "r4") %>% 
+  
+  addPolygons(data = water,
+              color = "blue" ,
+              group = "water") %>% 
+
+  addPolygons(data = veg,
+              color = "green",
+              group = "veg"  ) %>% 
+  
+  addLayersControl("topright",
+                   overlayGroups = c("r1","r2","r3","r4","water","veg"))
+
+```
+
+Alignement seems to be perfect, let's see how the scenes compare in the RGB view
+
+```{r}
+m1 = viewRGB(brick(paste0("data/crop_rasters/",crops[1]), r=4,g=3,b=2, quantiles=NULL))
+m2 = viewRGB(brick(paste0("data/crop_rasters/",crops[2]), r=4,g=3,b=2, quantiles=NULL))
+m3 = viewRGB(brick(paste0("data/crop_rasters/",crops[3]), r=4,g=3,b=2, quantiles=NULL))
+m4 = viewRGB(brick(paste0("data/crop_rasters/",crops[4]), r=4,g=3,b=2, quantiles=NULL))
+mA = sync(m1,m2,m3,m4, ncol=2)
+mA
+
+```
+
+```{r}
+library(htmlwidgets)
+library(htmltools)
+save_tags <- function (tags, file, selfcontained = F, libdir = "./lib") 
+{
+  if (is.null(libdir)) {
+    libdir <- paste(tools::file_path_sans_ext(basename(file)), 
+                    "_files", sep = "")
+  }
+  htmltools::save_html(tags, file = file, libdir = libdir)
+  if (selfcontained) {
+    if (!htmlwidgets:::pandoc_available()) {
+      stop("Saving a widget with selfcontained = TRUE requires pandoc. For details see:\n", 
+           "https://github.com/rstudio/rmarkdown/blob/master/PANDOC.md")
+    }
+    htmlwidgets:::pandoc_self_contained_html(file, file)
+    unlink(libdir, recursive = TRUE)
+  }
+  return(file)
+}
+save_tags(mA, "nic_4pane_432.html", selfcontained = T)
+```
+
+Since the ground reflectance values seem very different for every images, we will tend towards the use of band ratios instead of single bands for classification.
+
+```{r}
+layers2 = layers[3:13]
+
+r1 = brick(paste0("data/crop_rasters/",crops[1])) ; names(r1) = layers2
+r2 = brick(paste0("data/crop_rasters/",crops[2])) ; names(r2) = layers2
+r3 = brick(paste0("data/crop_rasters/",crops[3])) ; names(r3) = layers2
+r4 = brick(paste0("data/crop_rasters/",crops[4])) ; names(r4) = layers2
+
+r1$NDVI = (r1$X833-r1$X665) / (r1$X833+r1$X665)
+r2$NDVI = (r2$X833-r2$X665) / (r2$X833+r2$X665)
+r3$NDVI = (r3$X833-r3$X665) / (r3$X833+r3$X665)
+r4$NDVI = (r4$X833-r4$X665) / (r4$X833+r4$X665)
+
+```
+
+
+```{r}
+water1 = mask(r1, water)
+water2 = mask(r2, water)
+water3 = mask(r3, water)
+water4 = mask(r4, water)
+
+veg1 = mask(r1, veg)
+veg2 = mask(r2, veg)
+veg3 = mask(r3, veg)
+veg4 = mask(r4, veg)
+
+```
+
+```{r}
+dev.off()
+par(mfrow=c(2,2))
+boxplot(water1)
+boxplot(water2)
+boxplot(water3)
+boxplot(water4)
+boxplot(veg1)
+boxplot(veg2)
+boxplot(veg3)
+boxplot(veg4)
+```
+
+an NDVI treshold of about 0 seems to work fine. let'S look at the maps.
+
+```{r}
+r_ndvi = brick(r1$NDVI,r2$NDVI,r3$NDVI,r4$NDVI)
+
+val = c(-1.1,1.1)
+pal = colorNumeric("RdYlGn",
+                   val,
+                   na.color = "transparent")
+
+
+leaflet() %>% 
+  
+  addRasterImage(r_ndvi$NDVI.1,
+                 col = pal, group = "r1",
+                 layerId = "r1") %>% 
+  
+  addRasterImage(r_ndvi$NDVI.2,
+                 col = pal, group = "r2",
+                 layerId = "r2") %>% 
+  
+  addRasterImage(r_ndvi$NDVI.3,
+                 col = pal, group = "r3",
+                 layerId = "r3") %>% 
+  
+  addRasterImage(r_ndvi$NDVI.4,
+                 col = pal, group = "r4",
+                 layerId = "r4") %>% 
+  
+  addPolygons(data = water,
+              color = "blue" ,
+              group = "water") %>% 
+
+  addPolygons(data = veg,
+              color = "green",
+              group = "veg"  ) %>% 
+  
+  addLegend("bottomright",
+            pal = pal,
+            values = val,
+            title = "NDVI") %>% 
+  
+  addMouseCoordinates() %>% 
+  
+  addImageQuery(r_ndvi$NDVI.1, type="mousemove", layerId = c("r1")) %>% 
+  addImageQuery(r_ndvi$NDVI.2, type="mousemove", layerId = c("r2")) %>% 
+  
+  
+  addLayersControl("topright",
+                   overlayGroups = c("r1","r2","r3","r4","water","veg"))
+```
+
+```{r}
+r_ndvi = brick(r1$NDVI,r2$NDVI,r3$NDVI,r4$NDVI)
+
+val = c(-1.1,1.1)
+pal = colorNumeric("RdYlGn",
+                   val,
+                   na.color = "transparent")
+
+ndvi1 = leaflet() %>% 
+  addRasterImage(r_ndvi$NDVI.1,
+                 col = pal,
+                 layerId = "ndvi") %>% 
+  addPolygons(data = water,
+              color = "blue" ,
+              group = "water") %>% 
+  addPolygons(data = veg,
+              color = "green",
+              group = "veg"  ) %>% 
+  addLegend("bottomright",
+            pal = pal,
+            values = val,
+            title = "NDVI") %>% 
+  addMouseCoordinates() %>% 
+  addImageQuery(r_ndvi$NDVI.1, type="mousemove", layerId = c("ndvi"))
+
+ndvi2 = leaflet() %>% 
+  addRasterImage(r_ndvi$NDVI.2,
+                 col = pal,
+                 layerId = "ndvi") %>% 
+  addPolygons(data = water,
+              color = "blue" ,
+              group = "water") %>% 
+  addPolygons(data = veg,
+              color = "green",
+              group = "veg"  ) %>% 
+  addLegend("bottomright",
+            pal = pal,
+            values = val,
+            title = "NDVI") %>% 
+  addMouseCoordinates() %>% 
+  addImageQuery(r_ndvi$NDVI.2, type="mousemove", layerId = c("ndvi"))
+
+ndvi3 = leaflet() %>% 
+  addRasterImage(r_ndvi$NDVI.3,
+                 col = pal,
+                 layerId = "ndvi") %>% 
+  addPolygons(data = water,
+              color = "blue" ,
+              group = "water") %>% 
+  addPolygons(data = veg,
+              color = "green",
+              group = "veg"  ) %>% 
+  addLegend("bottomright",
+            pal = pal,
+            values = val,
+            title = "NDVI") %>% 
+  addMouseCoordinates() %>% 
+  addImageQuery(r_ndvi$NDVI.3, type="mousemove", layerId = c("ndvi"))
+
+ndvi4 = leaflet() %>% 
+  addRasterImage(r_ndvi$NDVI.4,
+                 col = pal,
+                 layerId = "ndvi") %>% 
+  addPolygons(data = water,
+              color = "blue" ,
+              group = "water") %>% 
+  addPolygons(data = veg,
+              color = "green",
+              group = "veg"  ) %>% 
+  addLegend("bottomright",
+            pal = pal,
+            values = val,
+            title = "NDVI") %>% 
+  addMouseCoordinates() %>% 
+  addImageQuery(r_ndvi$NDVI.4, type="mousemove", layerId = c("ndvi"))
+
+ndvi_maps = sync(ndvi1,ndvi2,ndvi3,ndvi4)
+
+save_tags <- function (tags, file, selfcontained = F, libdir = "./lib") 
+{
+  if (is.null(libdir)) {
+    libdir <- paste(tools::file_path_sans_ext(basename(file)), 
+                    "_files", sep = "")
+  }
+  htmltools::save_html(tags, file = file, libdir = libdir)
+  if (selfcontained) {
+    if (!htmlwidgets:::pandoc_available()) {
+      stop("Saving a widget with selfcontained = TRUE requires pandoc. For details see:\n", 
+           "https://github.com/rstudio/rmarkdown/blob/master/PANDOC.md")
+    }
+    htmlwidgets:::pandoc_self_contained_html(file, file)
+    unlink(libdir, recursive = TRUE)
+  }
+  return(file)
+}
+save_tags(ndvi_maps, "nic_4pane_ndvi.html", selfcontained = T)
+```
+
+it seems like a reasonnable band ratio treshold would be ndvi = 0. But still, it should not be expected to hold up in every single cases
+
+CLOUDS : 
+```{r}
+r_cloud = brick(r1$X492,r2$X492,r3$X492,r4$X492)
+
+val = c(0,1)
+pal = colorNumeric("RdYlGn",
+                   val,
+                   na.color = "transparent")
+
+cloud1 = leaflet() %>% 
+  addRasterImage(r_cloud$X492.1,
+                 col = pal,
+                 layerId = "B2") %>% 
+  addPolygons(data = water,
+              color = "blue" ,
+              group = "water") %>% 
+  addPolygons(data = veg,
+              color = "green",
+              group = "veg"  ) %>% 
+  addLegend("bottomright",
+            pal = pal,
+            values = val,
+            title = "B2") %>% 
+  addMouseCoordinates() %>% 
+  addImageQuery(r_cloud$X492.1, type="mousemove", layerId = c("cloud"))
+
+cloud2 = leaflet() %>% 
+  addRasterImage(r_cloud$X492.2,
+                 col = pal,
+                 layerId = "B2") %>% 
+  addPolygons(data = water,
+              color = "blue" ,
+              group = "water") %>% 
+  addPolygons(data = veg,
+              color = "green",
+              group = "veg"  ) %>% 
+  addLegend("bottomright",
+            pal = pal,
+            values = val,
+            title = "B2") %>% 
+  addMouseCoordinates() %>% 
+  addImageQuery(r_cloud$X492.2, type="mousemove", layerId = c("cloud"))
+
+cloud3 = leaflet() %>% 
+  addRasterImage(r_cloud$X492.3,
+                 col = pal,
+                 layerId = "B2") %>% 
+  addPolygons(data = water,
+              color = "blue" ,
+              group = "water") %>% 
+  addPolygons(data = veg,
+              color = "green",
+              group = "veg"  ) %>% 
+  addLegend("bottomright",
+            pal = pal,
+            values = val,
+            title = "B2") %>% 
+  addMouseCoordinates() %>% 
+  addImageQuery(r_cloud$X492.3, type="mousemove", layerId = c("cloud"))
+
+cloud4 = leaflet() %>% 
+  addRasterImage(r_cloud$X492.4,
+                 col = pal,
+                 layerId = "B2") %>% 
+  addPolygons(data = water,
+              color = "blue" ,
+              group = "water") %>% 
+  addPolygons(data = veg,
+              color = "green",
+              group = "veg"  ) %>% 
+  addLegend("bottomright",
+            pal = pal,
+            values = val,
+            title = "B2") %>% 
+  addMouseCoordinates() %>% 
+  addImageQuery(r_cloud$X492.4, type="mousemove", layerId = c("cloud"))
+
+cloud_maps = sync(cloud1,cloud2,cloud3,cloud4)
+
+save_tags <- function (tags, file, selfcontained = F, libdir = "./lib") 
+{
+  if (is.null(libdir)) {
+    libdir <- paste(tools::file_path_sans_ext(basename(file)), 
+                    "_files", sep = "")
+  }
+  htmltools::save_html(tags, file = file, libdir = libdir)
+  if (selfcontained) {
+    if (!htmlwidgets:::pandoc_available()) {
+      stop("Saving a widget with selfcontained = TRUE requires pandoc. For details see:\n", 
+           "https://github.com/rstudio/rmarkdown/blob/master/PANDOC.md")
+    }
+    htmlwidgets:::pandoc_self_contained_html(file, file)
+    unlink(libdir, recursive = TRUE)
+  }
+  return(file)
+}
+save_tags(cloud_maps, "nic_4pane_clouds.html", selfcontained = T)
+```
+
+the cloud masking doesn't really have a suitable band ratios, so we have to use a single band treshold. those are expected to create a lot of noise around the masks, since a single value doesn't really fit all the data. b2's baseline is much higher in image 3 (winter), so it might behave poorly in some extreme cases, but a value of somewhere around 0.3 seems reasonable to limit data loss.
+
+
+

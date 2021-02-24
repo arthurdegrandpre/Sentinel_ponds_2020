@@ -1,0 +1,856 @@
+---
+title: "03_v3_chla_models"
+author: "Arthur de Grandpré"
+date: "11 septembre 2020"
+output: 
+  html_document: 
+    toc: yes
+    toc_float: yes
+---
+
+This is an attempt to make a clear and simple run of the modelling exercise for chlorophyll-a in the Midden-Limburg de Wijers ponds.
+
+```{r setup, include=FALSE, message=F, warning=F}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls());gc()
+library(stargazer)
+library(tidyverse)
+library(ggplot2)
+library(reshape2)
+library(lubridate)
+library(car)
+library(MuMIn)
+library(MASS)
+library(gridExtra)
+library(sjPlot)
+library(sjmisc)
+library(sjlabelled)
+library(lmvar)
+library(svMisc)
+library(leaflet)
+library(sf)
+
+model_selector = function(initial_model,dataset){
+
+  final_model=initial_model
+  fit=lm(final_model, data=dataset)
+  step=stepAIC(fit, direction="both",trace=F) # this is the actual model tester
+  
+dha = as.data.frame(attributes(step$anova)$heading)
+dhas=dha[(which(dha$`attributes(step$anova)$heading`=="\nFinal Model:")+1):(length(dha$`attributes(step$anova)$heading`)-1),]
+fit_step=lm(paste0(dhas[1:length(dhas)]),data=dataset)
+
+vif_s=vif(fit_step)
+max_vif=which(vif_s==max(vif_s)) # if the variable with the highest vif has a score over 5, this variable will be removed within the following repeat loop
+
+      if (max(vif_s)>5) {
+ repeat {
+max_vif
+  ifelse(max_vif==1,
+         (gsub_model=gsub(paste0(names(max_vif)," + "),"",final_model, fixed=T)),
+         (gsub_model=gsub(paste0(" + ",names(max_vif)),"",final_model, fixed=T))
+         )
+
+    ifelse((length(gsub_model)>1),
+           (final_model=paste(gsub_model[2],gsub_model[1],gsub_model[3])),
+           (final_model=gsub_model)
+           )
+  
+    fit=lm(final_model, data=dataset)
+    step=stepAIC(fit,direction="both",trace=F)
+
+dha = as.data.frame(attributes(step$anova)$heading)
+dhas=dha[(which(dha$`attributes(step$anova)$heading`=="\nFinal Model:")+1):(length(dha$`attributes(step$anova)$heading`)-1),]
+dhas
+fit_step=lm(paste0(dhas[1:length(dhas)]),data=dataset)
+length(fit_step$coefficients)
+    
+ if (length(fit_step$coefficients)==2) break   
+
+        vif_s=vif(fit_step)
+    max_vif=which(vif_s==max(vif_s))
+    #exit condition
+    if (max(vif_s)<5) break}}
+
+  return(step$anova)
+}
+
+
+# Function that returns Root Mean Squared Error
+rmse <- function(error)
+{sqrt(mean(error^2))}
+ 
+# Function that returns Mean Absolute Error
+mae <- function(error)
+{mean(abs(error))}
+
+```
+
+The data used here comes from Lvl-1 sentinel2 A and B multispectral imagery.  
+It was atmospherically corrected by Nicolas using Acolite  
+It was then corrected for adjacency effects using the similarity spectrum method, as adapted from Nicolas' internship to work within the R ecosystem.  
+
+The table below inspects the resulting dataframe.
+```{r, echo=F}
+
+acolite=read.csv("../data/simspec2020.csv")
+acolite$date=ymd(gsub("_","-",acolite$date))
+colnames(acolite)
+acolite=acolite[,c(-1,-2)]
+colnames(acolite) = c("x","y","b1","b2","b3","b4","b5","b6","b7","b8","bx","b11","b12","date","satellite","pond","class")
+stargazer(acolite, type="text")
+
+```
+
+We appear have <0 and >1 data, altough most data points appear to be within the 0-1 range.  
+Data outside this range is unexpect and abnormal, it should then be excluded, rescaled or reassigned.  
+For now, let's assign low and high values within the 0-1 range. exactly 0 or 1 could cause issues.  
+
+```{r}
+acolite[,3:13][acolite[,3:13]<0]=0.005
+acolite[,3:13][acolite[,3:13]>1]=0.9
+```
+
+Let's set up the models.
+
+# Chl-a models
+
+We will create multiple models to evaluate their performance.  
+First: a linear regression model taking every pixels from every date with matching field data and satellite overpass.  
+Second: a linear regression model taking pond mean values from every date with matching field data and satellite overpass.  
+Third: a linear regression model taking monthly pond mean values and monthly field average.  
+Fourth: The best model will be retested including interaction terms  
+
+All spectral bands will be included in the model selector, which rejects bad predictors based on VIF and AIC.  
+Spectral ratios will also be included in the predictors, as tested within Nic's MSc thesis.  
+  
+a <- b3/b1  
+k <- b3/b2 where k replaces b for clarity  
+c <- b3/b4  
+d <- b5/b4  
+e <- b6/b4  
+f <- b7/b4  
+g <- bx/b4 where bx is band8A  
+h <- b8/b4  
+i <- (b5+b6)/b4  
+j <- b5-((b4+b6)/2)  
+
+Ratios and bands from a 60m resolution will not be included
+
+## 1. individual pixels
+
+```{r ind pix fit, include=F}
+edf=read.csv("../data/eyerusalem_data_interp.csv")
+colnames(edf)=c("unkown","date","pond","chla.rfu","pc.rfu","sub.cover","sneller","chla") # chla is extracted from chla.rfu based on this equation : 0.0428*CHLA.rfu+3.2467
+
+edf$date=ymd(edf$date)
+
+df=left_join(acolite, edf)
+df=df[complete.cases(df),]
+
+####
+
+df$a <- df$b3/df$b1 # note that band 1 is 60m in resolution
+df$k <- df$b3/df$b2 # ratio b renamed to k to for conflict resolution
+# green-red
+df$c <- df$b3/df$b4
+# NIR-red
+df$d <- df$b5/df$b4
+df$e <- df$b6/df$b4
+df$f <- df$b7/df$b4
+df$g <- df$bx/df$b4
+df$h <- df$b8/df$b4
+# NIR-red 3-and
+df$i <- (df$b5+df$b6)/df$b4
+df$j <- df$b5-((df$b4+df$b6)/2)
+
+df$logchla=log(df$chla) # this is just to make readings easier
+
+####
+
+evdf = read.csv("../data/emerging_vegetation_simspec.csv")
+evdf = evdf[,c(2,3,7)]
+colnames(evdf)=c("pond","date","v")
+evdf$date = ymd(evdf$date)
+df = left_join(df,evdf)
+df = df[complete.cases(df),]
+df = df[!is.infinite(rowSums(df[,c(3:13,24:35)])),]
+dfp = df
+```
+
+
+```{r, include=T, message=F, warning=F}
+initial_model = sqrt(chla)~b2+b3+b4+b5+b6+b7+b8+bx+b11+b12+k+c+d+e+f+g+h+i+j
+dataset = df
+
+model = model_selector(initial_model, dataset)
+
+fit.allpix=lm(attributes(model)$heading[length(attributes(model)$heading)-1], data=df)
+summary(fit.allpix)
+options(na.action=na.fail)
+d=(dredge(fit.allpix))
+head(d)
+options(na.action=na.omit)
+
+# plot(fit.allpix)
+hist(resid(fit.allpix))
+sqrt(mean(fit.allpix$residuals^2)) # RMSE
+
+df$chla.p = predict(fit.allpix, new.data=df)
+  
+plot(df$chla.p~sqrt(df$chla),
+     main="Acolite+SimSpec, all pixels, same day",
+     xlab="sqrt Measured Chlorophyll a (ug/L)",
+     ylab="sqrt Predicted Chlorophyll a (ug/L)")
+
+```
+
+## 2. pond mean
+
+```{r, include=F}
+ac_msd = acolite %>%
+  filter(class=="water") %>% 
+  group_by(date, pond) %>%
+  summarise_at(vars(b1,b2,b3,b4,b5,b6,b7,b8,bx,b11,b12), funs(mean,sd)) %>%
+  ungroup
+
+ac_m = ac_msd[1:13]
+colnames(ac_m)=c("date","pond","b1","b2","b3","b4","b5","b6","b7","b8","bx","b11","b12") #b8a becomes bx so there are no conflicts
+ac_m$source="acolite"
+df = ac_m
+
+####
+
+edf=read.csv("../data/eyerusalem_data_interp.csv")
+colnames(edf)=c("unkown","date","pond","chla.rfu","pc.rfu","sub.cover","sneller","chla") # chla is extracted from chla.rfu based on this equation : 0.0428*CHLA.rfu+3.2467
+
+edf$date=ymd(edf$date)
+
+df=left_join(df, edf)
+df=df[complete.cases(df),]
+
+####
+
+df$a <- df$b3/df$b1 # note that band 1 is 60m in resolution
+df$k <- df$b3/df$b2 # ratio b renamed to k to for conflict resolution
+# green-red
+df$c <- df$b3/df$b4
+# NIR-red
+df$d <- df$b5/df$b4
+df$e <- df$b6/df$b4
+df$f <- df$b7/df$b4
+df$g <- df$bx/df$b4
+df$h <- df$b8/df$b4
+# NIR-red 3-and
+df$i <- (df$b5+df$b6)/df$b4
+df$j <- df$b5-((df$b4+df$b6)/2)
+
+df$logchla=log(df$chla) # this is just to make readings easier
+
+####
+
+evdf = read.csv("../data/emerging_vegetation_simspec.csv")
+evdf = evdf[,c(2,3,7)]
+colnames(evdf)=c("pond","date","v")
+evdf$date = ymd(evdf$date)
+df = left_join(df,evdf)
+df = df[complete.cases(df),]
+```
+
+
+```{r}
+initial_model=sqrt(chla)~b2+b3+b4+b5+b6+b7+b8+bx+b11+b12+k+c+d+e+f+g+h+i+j
+dataset=df
+
+model=model_selector(initial_model, dataset)
+
+fit.meanp=lm(attributes(model)$heading[length(attributes(model)$heading)-1], data=df)
+summary(fit.meanp)
+options(na.action=na.fail)
+d=(dredge(fit.meanp))
+head(d)
+options(na.action=na.omit)
+
+# summary(fit.meanp)
+# plot(fit.meanp)
+hist(resid(fit.meanp))
+sqrt(mean(fit.meanp$residuals^2))
+
+df$chla.p = predict(fit.meanp, new.data=df)
+  
+plot(df$chla.p~sqrt(df$chla),
+     main="Acolite+SimSpec mean pond",
+     xlab="sqrt Measured Chlorophyll a (ug/L)",
+     ylab="sqrt Predicted Chlorophyll a (ug/L)")
+
+```
+
+## 3. monthly pond mean
+
+```{r, include=F}
+ac_msd = acolite %>%
+  filter(class=="water") %>% 
+  group_by(date, pond) %>%
+  summarise_at(vars(b1,b2,b3,b4,b5,b6,b7,b8,bx,b11,b12), funs(mean,sd)) %>%
+  ungroup
+
+ac_m = ac_msd[1:13]
+colnames(ac_m)=c("date","pond","b1","b2","b3","b4","b5","b6","b7","b8","bx","b11","b12") #b8a becomes bx so there are no conflicts
+ac_m$source="acolite"
+df = ac_m
+
+###
+
+edf=read.csv("../data/eyerusalem_data_interp.csv")
+colnames(edf)=c("unkown","date","pond","chla.rfu","pc.rfu","sub.cover","sneller","chla") # chla is extracted from chla.rfu based on this equation : 0.0428*CHLA.rfu+3.2467
+
+edf$date=ymd(edf$date)
+
+df=left_join(df, edf)
+df=df[complete.cases(df),]
+
+###
+
+df$a <- df$b3/df$b1 # note that band 1 is 60m in resolution
+df$k <- df$b3/df$b2 # ratio b renamed to k to for conflict resolution
+# green-red
+df$c <- df$b3/df$b4
+# NIR-red
+df$d <- df$b5/df$b4
+df$e <- df$b6/df$b4
+df$f <- df$b7/df$b4
+df$g <- df$bx/df$b4
+df$h <- df$b8/df$b4
+# NIR-red 3-and
+df$i <- (df$b5+df$b6)/df$b4
+df$j <- df$b5-((df$b4+df$b6)/2)
+
+df$logchla=log(df$chla) # this is just to make readings easier
+
+###
+
+evdf = read.csv("../data/emerging_vegetation_simspec.csv")
+evdf = evdf[,c(2,3,7)]
+colnames(evdf)=c("pond","date","v")
+evdf$date = ymd(evdf$date)
+df = left_join(df,evdf)
+df = df[complete.cases(df),]
+# df = df[!is.infinite(rowSums(df[,c(3:13,24:35)])),]
+
+###
+
+df$date=ymd(df$date)
+df = df %>% group_by(month=floor_date(date, "month"),pond) %>% summarize_at(vars(b1,b2,b3,b4,b5,b6,b7,b8,bx,b11,b12,a,k,c,d,e,f,g,h,i,j,chla,logchla,chla.rfu,pc.rfu,sub.cover,sneller,v),funs(mean)) %>% ungroup 
+```
+
+
+```{r}
+initial_model=sqrt(chla)~b2+b3+b4+b5+b6+b7+b8+bx+b11+b12+k+c+d+e+f+g+h+i+j
+dataset=df
+
+model=model_selector(initial_model, dataset)
+
+fit.monthly=lm(attributes(model)$heading[length(attributes(model)$heading)-1], data=df, y=T, x=T)
+summary(fit.monthly)
+options(na.action=na.fail)
+d=(dredge(fit.monthly))
+head(d)
+options(na.action=na.omit)
+```
+
+we seem to obtain two equivalent models, one with 4 predictors and the other with 2. Let's look at the 4 predictors first.
+
+```{r}
+hist(resid(fit.monthly))
+sqrt(mean(fit.monthly$residuals^2))
+
+df$chla.p = predict(fit.monthly, new.data=df)
+  
+plot(df$chla.p~sqrt(df$chla),
+     main="Acolite+SimSpec mean monthly pond (4 pred.)",
+     xlab="sqrt Measured monthly mean Chlorophyll a (ug/L)",
+     ylab="sqrt Predicted monthly mean Chlorophyll a (ug/L)")
+```
+
+now the 2 predictors
+
+```{r}
+fit.monthly2=lm(sqrt(chla)~h+j,data=df,x=T,y=T)
+summary(fit.monthly2)
+# plot(fit.monthly2)
+hist(resid(fit.monthly2))
+sqrt(mean(fit.monthly2$residuals^2))
+
+df$chla.p2 = predict(fit.monthly2, new.data=df)
+
+plot(df$chla.p2~sqrt(df$chla),
+     main="Acolite+SimSpec mean monthly pond (2 pred.)",
+     xlab="sqrt Measured monthly mean Chlorophyll a (ug/L)",
+     ylab="sqrt Predicted monthly mean Chlorophyll a (ug/L)")
+
+```
+
+In both models, one point appears to be especially badly predicted. let's remove it.
+
+```{r, echo=F}
+plot(df$chla.p~sqrt(df$chla),
+     main="Acolite+SimSpec mean monthly pond (4 pred.)",
+     xlab="sqrt Measured monthly mean Chlorophyll a (ug/L)",
+     ylab="sqrt Predicted monthly mean Chlorophyll a (ug/L)",
+     type="n")
+text(sqrt(df$chla),df$chla.p,label=row.names(df))
+
+plot(df$chla.p2~sqrt(df$chla),
+     main="Acolite+SimSpec mean monthly pond (2 pred.)",
+     xlab="sqrt Measured monthly mean Chlorophyll a (ug/L)",
+     ylab="sqrt Predicted monthly mean Chlorophyll a (ug/L)",
+     type="n")
+text(sqrt(df$chla),df$chla.p2,label=row.names(df))
+
+```
+
+```{r}
+dfs = df[-34,]
+
+initial_model=sqrt(chla)~b2+b3+b4+b5+b6+b7+b8+bx+b11+b12+k+c+d+e+f+g+h+i+j
+dataset=dfs
+
+model=model_selector(initial_model, dataset)
+
+fit.monthly.s=lm(attributes(model)$heading[length(attributes(model)$heading)-1], data=dfs, y=T, x=T)
+summary(fit.monthly.s)
+options(na.action=na.fail)
+d=(dredge(fit.monthly.s))
+head(d)
+options(na.action=na.omit)
+
+hist(resid(fit.monthly.s))
+sqrt(mean(fit.monthly.s$residuals^2))
+
+dfs$chla.ps = predict(fit.monthly.s, newdata=dfs)
+
+plot(dfs$chla.ps~sqrt(dfs$chla),
+     main="Acolite+SimSpec mean monthly pond (- outlier)",
+     xlab="sqrt Measured monthly mean Chlorophyll a (ug/L)",
+     ylab="sqrt Predicted monthly mean Chlorophyll a (ug/L)")
+
+```
+
+In case the model isn't completely linear, let's try it with polynomial terms
+
+```{r}
+fit.monthly.poly=lm(sqrt(chla)~poly(b11,2)+poly(b8,2)+poly(c,2)+poly(h,2)+poly(j,2), data=df, y=T, x=T)
+summary(fit.monthly.poly)
+
+options(na.action=na.fail)
+d=(dredge(fit.monthly.poly))
+head(d)
+options(na.action=na.omit)
+
+# plot(fit.monthly.poly)
+hist(resid(fit.monthly.poly))
+sqrt(mean(fit.monthly.poly$residuals^2))
+
+dfs$chla.pc = predict(fit.monthly.poly, newdata=dfs)
+  
+plot(dfs$chla.pc~sqrt(dfs$chla),
+     main="Acolite simspec mean monthly pond, polynomial",
+     xlab="sqrt Measured monthly mean Chlorophyll a (ug/L)",
+     ylab="sqrt Predicted monthly mean Chlorophyll a (ug/L)")
+
+```
+
+## 4. Best model + interactions
+
+(Current best models contains too many predictors, hence there are not enough degrees of freedom to add interaction terms. They usually result in massive overfitting anyways.)
+
+# K-folds validation for overfitting
+
+Let's look only into the models based on monthly means and run a 100 iterations of every model at every k-folds number between 2 and 10. this will allow to see which models are most vulnerable to subsampling.
+
+```{r eval=FALSE, include=FALSE}
+rmse.k=as.data.frame(NULL)
+mae.k=as.data.frame(NULL)
+
+for(i in 1:100){
+print(i)
+# i=1
+for(j in 2:10){
+# j=2
+f1=cv.lm(fit.monthly, k=j, ks_test = F,log=F)
+f2=cv.lm(fit.monthly2, k=j, ks_test = F, log=F)
+f3=cv.lm(fit.monthly.s, k=j, ks_test = F, log=F)
+f4=cv.lm(fit.monthly.poly, k=j, ks_test = F, log=F)
+
+rmse.k2=as.data.frame(f1$MSE_sqrt)
+rmse.k2=rbind(rmse.k2, as.data.frame(f2$MSE_sqrt))
+rmse.k2=rbind(rmse.k2, as.data.frame(f3$MSE_sqrt))
+rmse.k2=rbind(rmse.k2, as.data.frame(f4$MSE_sqrt))
+rmse.k2$model=c("f1","f2","f3","f4")
+rmse.k2$k=j
+rmse.k=rbind(rmse.k,rmse.k2)
+
+mae.k2=as.data.frame(f1$MAE)
+mae.k2=rbind(mae.k2, as.data.frame(f2$MAE))
+mae.k2=rbind(mae.k2, as.data.frame(f3$MAE))
+mae.k2=rbind(mae.k2, as.data.frame(f4$MAE))
+mae.k2$model=c("f1","f2","f3","f4")
+mae.k2$k=j
+mae.k=rbind(mae.k,mae.k2)
+}}
+
+full.k=cbind(rmse.k,mae.k)
+full.k
+colnames(full.k)=c("rmse","rmse.sd","model","k","mae","mae.sd","model2","k2")
+full.k$model2=NULL
+full.k$k2=NULL
+write.csv(full.k, "../data/errors_full.csv")
+
+```
+
+```{r,echo=F}
+full.k=read.csv("../data/errors_full.csv")
+# full.k$model=gsub("f1","M1",full.k$model)
+# full.k$model=gsub("f2","M2",full.k$model)
+# full.k$model=gsub("f3","M3",full.k$model)
+# full.k$model=gsub("f4","M4",full.k$model)
+# 
+
+full.t=full.k %>% group_by(model,k) %>% summarise_at(vars(rmse,mae),funs(mean,sd)) %>% ungroup
+
+valrmse=ggplot(full.t,aes(x=k,y=(rmse_mean),col=model))+
+  geom_line()+
+  geom_errorbar(aes(ymin=(rmse_mean)-(rmse_sd), ymax=(rmse_mean)+(rmse_sd)),width=.2, position = position_dodge(0.5))+
+  # ylim(-1,5)+
+  theme_classic()+
+  ylab("RMSE")+
+  xlab("n folds")+
+  theme(legend.position = "none")
+
+valmae=ggplot(full.t,aes(x=k,y=(mae_mean),col=model))+
+  geom_line()+
+  geom_errorbar(aes(ymin=(mae_mean)-(mae_sd), ymax=(mae_mean)+(mae_sd)),width=.2, position = position_dodge(0.5))+
+  # ylim(-1,5)+
+  theme_classic()+
+  ylab("MAE")+
+  xlab("n folds")+
+  theme(legend.position = "none")
+
+valrmse2=ggplot(full.t,aes(x=k,y=(rmse_mean),col=model))+
+  geom_line()+
+  geom_errorbar(aes(ymin=(rmse_mean)-(rmse_sd), ymax=(rmse_mean)+(rmse_sd)),width=.2, position = position_dodge(0.5))+
+  # ylim(-1,5)+
+  theme_classic()+
+  ylab("RMSE")+
+  xlab("n folds")
+
+legend = cowplot::get_legend(valrmse2)
+grid.arrange(valrmse,valmae,legend, ncol=3, widths=c(4/9,4/9,1/9))
+
+```
+
+f1 and f3 appear to be roughly equivalent according to the k-folds validation. f3 being the outlier corrected model, it's reported fit should be much better.
+
+
+# Chl-a retrieval model
+
+## Model summary
+Let's go back to f3, the monthly average model with a single removed outlier.
+
+```{r, echo=F}
+
+summary(fit.monthly.s)
+
+hist(resid(fit.monthly.s))
+
+dfs$chla.pc = predict(fit.monthly.s, new.data=dfs)
+
+sqrt.error <- sqrt(dfs$chla) - dfs$chla.pc
+error = dfs$chla - dfs$chla.pc^2
+
+# sqrt figure
+ggplot(dfs, aes(x=sqrt(chla), y=chla.pc))+
+  geom_point()+
+  geom_smooth(method=lm)+
+  geom_abline(col="grey")+
+  ggtitle("Pond mean monthly sqrt chl-a, measured vs predicted")+
+  xlab("sqrt measured chl-a")+
+  ylab("sqrt predicted chl-a")+
+  annotate("text",x = 2.5, y = 12.5, hjust=0, size=3,
+           label = "sqrt(y) = 5.04 - 200.91*b8 - 116.86*b11 - 2.47*c + 3.95*h + 416.59*j")+
+  annotate("text",x = 2.5, y = 12, hjust=0,size=3,
+           label = "Multiple R-squared: 0.6158, 	Adjusted R-squared:  0.5741")+
+  annotate("text",x = 2.5, y = 11.5, hjust=0,size=3,
+           label = paste("MAE =", round(mae(sqrt.error),3)))+
+  annotate("text",x = 2.5, y = 11, hjust=0,size=3,
+           label = paste("RMSE =", round(rmse(sqrt.error),3)))+
+  theme_classic()
+
+  
+# non-sqrt figure
+ggplot(dfs, aes(x=chla, y=chla.pc^2))+
+  geom_point()+
+  geom_smooth(method=lm)+
+  geom_abline(col="grey")+
+  # xlim(0,160)+
+  # ylim(0,160)+
+  ggtitle("Pond mean monthly chl-a, measured vs predicted")+
+  xlab("measured chl-a (ug/L)")+
+  ylab("predicted chl-a (ug/L)")+
+  annotate("text",x = 2.5, y = 160, hjust=0, size=3,
+           label = "sqrt(y) = 5.04 - 200.91*b8 - 116.86*b11 - 2.47*c + 3.95*h + 416.59*j")+
+  annotate("text",x = 2.5, y = 155, hjust=0,size=3,
+           label = "Multiple R-squared: 0.6158, 	Adjusted R-squared:  0.5741")+
+  annotate("text",x = 2.5, y = 150, hjust=0,size=3,
+           label = paste("MAE =", round(mae(error),3)))+
+  annotate("text",x = 2.5, y = 145, hjust=0,size=3,
+           label = paste("RMSE =", round(rmse(error),3)))+
+  theme_classic()
+
+```
+
+## Model performance
+
+Let's look more closely into the model's performance, for each ponds and pond category.
+
+```{r, echo=FALSE}
+ggplot(dfs, aes(x=chla, y=chla.pc^2, col=pond))+
+  geom_abline(slope=1, intercept=0, col="grey")+
+  geom_point()+
+  geom_smooth(method=lm, se=F)+
+  xlim(0,160)+
+  ylim(0,160)+
+  xlab("Measured Chl-a ug/L")+
+  ylab("Predicted Chl-a ug/L")+
+  ggtitle("Measured vs Observed Chl-a in every pond")+
+  theme_classic()
+
+```
+
+```{r, echo=FALSE}
+ggplot(dfs, aes(x=chla, y=chla.pc^2, group=pond, col=pond))+
+  facet_wrap(~pond, scales="fixed")+
+  geom_abline(slope=1, intercept=0, col="grey")+
+  geom_point()+
+  geom_smooth(method=lm, se=F)+
+  # xlim(0,225)+
+  # ylim(0,225)+
+  xlab("Measured Chl-a ug/L")+
+  ylab("Predicted Chl-a ug/L")+
+  ggtitle("Measured vs Observed Chl-a in every pond")
+
+```
+
+Individually, it seems like some ponds are having trouble being predicted correctly, such as 1J5 and M15.
+1J5 is categorized as a low chlorophyll and high macrophyte density pond, which is excepted to be hard to predict. M15 should be a high chlorophyll and low macrophyte density pond. I am unsure why it behaves this way.
+
+M12 and V9 also don't have enough data points for their performance to be assessed.
+
+Let's do the same exercice directly with categories
+
+```{r, message=F, warning=F, include=F}
+categories=read.csv("../data/pond_categories_fixed.csv", sep=";")
+categories[,4:9]=NULL
+dfs = left_join(dfs,categories, by="pond")
+```
+
+```{r, echo=FALSE}
+ggplot(dfs, aes(x=chla, y=chla.pc^2, col=category))+
+  geom_abline(slope=1, intercept=0, col="grey")+
+  geom_point()+
+  geom_smooth(method=lm, se=F)+
+  xlim(0,160)+
+  ylim(0,160)+
+  xlab("Measured Chl-a ug/L")+
+  ylab("Predicted Chl-a ug/L")+
+  ggtitle("Measured vs Observed Chl-a by category")+
+  theme_classic()
+
+```
+
+```{r, echo=FALSE}
+ggplot(dfs, aes(x=chla, y=chla.pc^2, col=pond, group=category))+
+  facet_wrap(~category)+
+  geom_abline(slope=1, intercept=0, col="grey")+
+  geom_point()+
+  geom_smooth(method=lm, se=F)+
+  xlim(0,225)+
+  ylim(0,225)+
+  xlab("Measured Chl-a ug/L")+
+  ylab("Predicted Chl-a ug/L")+
+  ggtitle("Measured vs Observed Chl-a by category")+
+  theme_classic()
+
+```
+
+We see that the categories are very badly distributed, with much more data within the HCLM category than the others. We also have very little data about the HCHM category. This category contains M11, M12, V16 and V17. All of those are small ponds, so small even that no "pure" water pixels were kept for V16 and V17, and both M ponds are marked for "floating" vegetation.  
+
+In the case of the other categories, as expected LCHM seems to be the hardest to evaluate. low chlorophyll contents are hard to detect as other features are more susceptible to be included in the pixel. It is also harder in the case of high macrophytes, as this can reduces available data in the case of emerging vegetation, or corrupt the specral signature, in the case of submerged vegetation.
+
+# Model application
+
+Let's apply the model to individual pixels and to ponds.  
+Pixels identified as emergent vegetation will be classified as such.
+
+## all pixels
+
+```{r, include=F}
+
+df = acolite
+
+df$a <- df$b3/df$b1 # note that band 1 is 60m in resolution
+df$k <- df$b3/df$b2 # ratio b renamed to k to for conflict resolution
+# green-red
+df$c <- df$b3/df$b4
+# NIR-red
+df$d <- df$b5/df$b4
+df$e <- df$b6/df$b4
+df$f <- df$b7/df$b4
+df$g <- df$bx/df$b4
+df$h <- df$b8/df$b4
+# NIR-red 3-and
+df$i <- (df$b5+df$b6)/df$b4
+df$j <- df$b5-((df$b4+df$b6)/2)
+
+df$chla.pc = predict(fit.monthly.s, newdata=df)
+
+```
+
+### summer
+
+let's select a date in july 2015
+
+```{r, echo=F}
+dfds = df %>% 
+  filter(date == unique(df$date)[1])
+
+dfds = st_as_sf(dfds, coords=c("x","y"))
+st_crs(dfds) = 4326
+
+dfds$chla.p = dfds$chla.pc^2
+summary(dfds$chla.p)
+
+cpal = colorNumeric("YlOrRd", domain=c(10,160)) 
+
+leaflet() %>% 
+  addTiles() %>% 
+  addCircles(data=filter(dfds,class=="vegetation"),
+             col="green",
+             stroke=F,
+             fillOpacity = 0.8) %>% 
+  
+  addCircles(data=filter(dfds,class=="water"),
+             fillColor=~cpal(chla.p),
+             stroke=F,
+             fillOpacity = 0.8) %>%
+  
+  addLegend(data=filter(dfds,class=="water"),
+            "bottomright",
+            pal = cpal,
+            values = c(10,160),
+            title = "Chl-a (ug/L)") %>%
+  
+  addLegend("bottomright",
+            colors ="green",
+            labels ="vegetation") %>% 
+  
+  addScaleBar(position="bottomleft")
+
+```
+
+
+### winter
+
+Let's select a date in january 2016
+
+```{r, echo=F}
+
+dfdw = df %>% 
+  filter(date == unique(df$date)[4])
+
+dfdw = st_as_sf(dfdw, coords=c("x","y"))
+st_crs(dfdw) = 4326
+
+dfdw$chla.p = dfdw$chla.pc^2
+summary(dfdw$chla.p)
+
+cpal = colorNumeric("YlOrRd", domain=c(10,160)) 
+
+leaflet() %>% 
+  addTiles() %>% 
+  addCircles(data=filter(dfdw,class=="vegetation"),
+             col="green",
+             stroke=F,
+             fillOpacity = 0.8) %>% 
+  
+  addCircles(data=filter(dfdw,class=="water"),
+             fillColor=~cpal(chla.p),
+             stroke=F,
+             fillOpacity = 0.8) %>%
+  
+  addLegend(data=filter(dfdw,class=="water"),
+            "bottomright",
+            pal = cpal,
+            values = c(10,160),
+            title = "Chl-a (ug/L)") %>%
+  
+  addLegend("bottomright",
+            colors ="green",
+            labels ="vegetation") %>% 
+  
+  addScaleBar(position="bottomleft")
+```
+
+# Seasonnal trends
+
+
+```{r, echo=F}
+
+df = ac_m
+
+df$a <- df$b3/df$b1 # note that band 1 is 60m in resolution
+df$k <- df$b3/df$b2 # ratio b renamed to k to for conflict resolution
+# green-red
+df$c <- df$b3/df$b4
+# NIR-red
+df$d <- df$b5/df$b4
+df$e <- df$b6/df$b4
+df$f <- df$b7/df$b4
+df$g <- df$bx/df$b4
+df$h <- df$b8/df$b4
+# NIR-red 3-and
+df$i <- (df$b5+df$b6)/df$b4
+df$j <- df$b5-((df$b4+df$b6)/2)
+
+evdf = read.csv("../data/emerging_vegetation_simspec.csv")
+evdf = evdf[,c(2,3,7)]
+colnames(evdf)=c("pond","date","v")
+evdf$date = ymd(evdf$date)
+df = left_join(df,evdf)
+
+df$chla.pc = predict(fit.monthly.s, newdata=df)
+df$chla.p = df$chla.pc^2
+
+df = df %>% 
+  filter(chla.p<250)
+
+ggplot(df, aes(x=date, y=chla.p, col=pond))+
+  geom_line()+
+  facet_wrap(~pond)+
+  theme_minimal()+
+  theme(legend.position = "none")+
+  ggtitle("seasonal chl-a trends per pond")+
+  ylab("predicted chl-a (ug/L)")+
+  geom_point(size=0.5)
+
+ggplot(df, aes(x=date, y=v, col=pond))+
+  geom_line()+
+  facet_wrap(~pond)+
+  theme_minimal()+
+  theme(legend.position = "none") + 
+  ggtitle("seasonal vegetation cover per pond")+
+  ylab("predicted veg. cover")+
+  geom_point(size=0.5)
+
+```
+
